@@ -1,28 +1,34 @@
-package com.tmw.backend.audit;
+package com.tmw.backend.exception;
 
-
-import backend.common.entity.BaseEntity;
+import com.tmw.backend.common.entity.BaseEntity;
+import com.tmw.backend.invoice.Invoice;
+import com.tmw.backend.match.Match;
+import com.tmw.backend.user.AppUser;
 import jakarta.persistence.*;
 import lombok.Getter;
 import lombok.Setter;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
-import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.UUID;
 
 @Entity
 @Table(name = "match_exceptions")
 @Getter @Setter
 public class MatchException extends BaseEntity {
 
-    @Column(name = "invoice_id", nullable = false)
-    private UUID invoiceId;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "invoice_id", nullable = false)
+    private Invoice invoice;
 
-    @Column(name = "match_id")
-    private UUID matchId;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "match_id")
+    private Match match;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "resolved_by")
+    private AppUser resolvedBy;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
@@ -35,16 +41,4 @@ public class MatchException extends BaseEntity {
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb", nullable = false)
     private Map<String, Object> details = new HashMap<>();
-
-    @Column(name = "suggested_action")
-    private String suggestedAction;
-
-    @Column(name = "resolved_by")
-    private UUID resolvedBy;
-
-    @Column(name = "resolved_at")
-    private Instant resolvedAt;
-
-    @Version
-    private Integer version;
 }

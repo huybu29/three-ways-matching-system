@@ -1,8 +1,11 @@
 package com.tmw.backend.audit;
 
 import jakarta.persistence.*;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Getter;
-import lombok.Setter;
+import lombok.NoArgsConstructor;
 import org.hibernate.annotations.Immutable;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
@@ -16,13 +19,17 @@ import java.util.UUID;
 @Entity
 @Table(name = "audit_logs")
 @Immutable
-@Getter @Setter
+@Getter
+@Builder
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+@AllArgsConstructor(access = AccessLevel.PRIVATE)
 public class AuditLog {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @Builder.Default
     @Column(name = "occurred_at", nullable = false)
     private Instant occurredAt = Instant.now();
 
@@ -30,6 +37,7 @@ public class AuditLog {
     private UUID actorId;
 
     @JdbcTypeCode(SqlTypes.JSON)
+    @Builder.Default
     @Column(name = "actor_roles", columnDefinition = "jsonb", nullable = false)
     private List<String> actorRoles = new ArrayList<>();
 

@@ -1,4 +1,4 @@
-package com.tmw.backend.audit;
+package com.tmw.backend.exception;
 
 public enum ExceptionType {
     PRICE_VARIANCE,

@@ -5,6 +5,7 @@ import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.context.request.RequestContextHolder;
@@ -15,6 +16,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Aspect
 @Component
@@ -28,7 +30,6 @@ public class AuditAspect {
 
     @Around("@annotation(auditable)")
     public Object auditMethod(ProceedingJoinPoint joinPoint, Auditable auditable) throws Throwable {
-        // 1. Tự động lấy Request ID và IP Address từ HTTP Request
         String requestId = null;
         String ipAddress = null;
         ServletRequestAttributes attr = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
@@ -38,30 +39,38 @@ public class AuditAspect {
             ipAddress = request.getRemoteAddr();
         }
 
-        // 2. Lấy thông tin Actor (User đang đăng nhập và Roles)
         List<String> roles = List.of();
+        UUID actorId = null;
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (auth != null && auth.getPrincipal() instanceof org.springframework.security.core.userdetails.UserDetails) {
-            // Lấy thông tin user tùy theo cấu hình security của dự án
+        if (auth != null && auth.isAuthenticated()) {
+            roles = auth.getAuthorities().stream()
+                    .map(GrantedAuthority::getAuthority)
+                    .collect(Collectors.toList());
         }
 
-        // Thực thi phương thức gốc
+        Map<String, Object> beforeData = new HashMap<>();
+        Object[] args = joinPoint.getArgs();
+        if (args.length > 0) {
+            beforeData.put("input_args", args[0]);
+        }
+
         Object result = joinPoint.proceed();
 
-        // 3. Tự động chụp và lưu bản ghi Audit Log vào database
-        AuditLog log = new AuditLog();
-        log.setOccurredAt(Instant.now());
-        log.setAction(auditable.action());
-        log.setEntityType(auditable.entityType());
-        log.setEntityId(UUID.randomUUID());
-
         Map<String, Object> afterData = new HashMap<>();
-        afterData.put("status", "SUCCESS");
-        log.setAfterData(afterData);
+        afterData.put("result", result);
 
-        log.setRequestId(requestId);
-        log.setIpAddress(ipAddress);
-        log.setActorRoles(roles);
+        AuditLog log = AuditLog.builder()
+                .occurredAt(Instant.now())
+                .action(auditable.action())
+                .entityType(auditable.entityType())
+                .entityId(UUID.randomUUID())
+                .actorId(actorId)
+                .actorRoles(roles)
+                .beforeData(beforeData)
+                .afterData(afterData)
+                .requestId(requestId)
+                .ipAddress(ipAddress)
+                .build();
 
         auditLogRepository.save(log);
 
