@@ -1,10 +1,11 @@
 spring:
   datasource:
-    url: jdbc:postgresql://localhost:5432/three_way_matching
-    username: twm_admin
+    url: jdbc:postgresql://localhost:5432/three_ways_matching
+    username: postgres
     password: twm_secret_2026
     driver-class-name: org.postgresql.Driver
   jpa:
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
     hibernate:
       ddl-auto: update
     show-sql: true
