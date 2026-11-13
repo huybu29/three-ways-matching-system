@@ -1,4 +1,4 @@
-package com.tmw.backend.common.entity;
+package backend.common.entity;
 
 import java.time.OffsetDateTime;
 import java.util.UUID;
