@@ -1,84 +1,114 @@
 package com.tmw.backend.matching.variance;
 
+import com.tmw.backend.common.enums.CurrencyCode;
+import com.tmw.backend.common.error.BusinessException;
+import com.tmw.backend.common.error.ErrorCode;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.util.Collection;
-import java.util.Objects;
 
-import static com.tmw.backend.matching.entity.DecimalScales.MONEY_SCALE;
-import static com.tmw.backend.matching.entity.DecimalScales.PCT_SCALE;
-import static com.tmw.backend.matching.entity.DecimalScales.QTY_SCALE;
-import static com.tmw.backend.matching.entity.DecimalScales.ROUNDING;
+import static com.tmw.backend.common.decimal.DecimalScales.*;
 
-/**
- * Khung thuật toán tính độ lệch số lượng (qty_variance) và độ lệch giá (price_variance).
- *
- * <p>Thuần tính toán, không truy cập DB, không có state → dễ unit test và dùng lại được ở
- * Auto-Match (GĐ3), Manual match (GĐ3) và Rematch (GĐ4).</p>
- *
- * <p>Việc so sánh với dung sai (qty_tolerance_pct, price_tolerance_pct, amount_tolerance_abs)
- * KHÔNG nằm ở đây – sẽ ghép với ToleranceEvaluationService của BE-2 ở Giai đoạn 3.</p>
- */
 @Component
 public class VarianceCalculator {
 
-    private static final BigDecimal HUNDRED = BigDecimal.valueOf(100);
+    private static final BigDecimal HUNDRED = new BigDecimal("100");
+    private static final int INTERMEDIATE_SCALE = 8;
 
-    public VarianceResult calculate(VarianceInput in) {
-        Objects.requireNonNull(in, "input");
+ 
+    public VarianceResult calculate(
+            BigDecimal matchedQty,
+            BigDecimal referenceQty,
+            BigDecimal invoiceUnitPrice,
+            BigDecimal poUnitPrice,
+            CurrencyCode invoiceCurrency,
+            CurrencyCode poCurrency
+    ) {
+        validateInputs(matchedQty, referenceQty, invoiceUnitPrice, poUnitPrice, invoiceCurrency, poCurrency);
 
-        BigDecimal referenceQty = qty(in.referenceQty());
-        BigDecimal invoiceQty = qty(in.invoiceQty());
-        BigDecimal invoicePrice = money(in.invoiceUnitPrice());
-        BigDecimal poPrice = money(in.poUnitPrice());
+        BigDecimal normMatchedQty = matchedQty.setScale(QTY_SCALE, ROUNDING);
+        BigDecimal normRefQty = referenceQty.setScale(QTY_SCALE, ROUNDING);
+        BigDecimal normInvPrice = invoiceUnitPrice.setScale(MONEY_SCALE, ROUNDING);
+        BigDecimal normPoPrice = poUnitPrice.setScale(MONEY_SCALE, ROUNDING);
 
-        // --- Độ lệch số lượng ---
-        BigDecimal qtyVariance = qty(invoiceQty.subtract(referenceQty));
-        BigDecimal qtyVariancePct = percent(qtyVariance, referenceQty);
+        // 1. Chênh lệch số lượng (dương = hóa đơn nhiều hơn tham chiếu, âm = hóa đơn ít hơn tham chiếu)
+        BigDecimal qtyVariance = normMatchedQty.subtract(normRefQty).setScale(QTY_SCALE, ROUNDING);
+        BigDecimal qtyVariancePct = qtyVariance.abs()
+                .divide(normRefQty, INTERMEDIATE_SCALE, ROUNDING)
+                .multiply(HUNDRED)
+                .setScale(PCT_SCALE, ROUNDING);
 
-        // --- Độ lệch đơn giá ---
-        BigDecimal priceVariance = money(invoicePrice.subtract(poPrice));
-        BigDecimal priceVariancePct = percent(priceVariance, poPrice);
+        // 2. Chênh lệch đơn giá
+        BigDecimal priceVariance = normInvPrice.subtract(normPoPrice).setScale(MONEY_SCALE, ROUNDING);
+        BigDecimal priceVariancePct;
+        if (normPoPrice.signum() == 0) {
+            priceVariancePct = normInvPrice.signum() == 0
+                    ? BigDecimal.ZERO.setScale(PCT_SCALE, ROUNDING)
+                    : HUNDRED.setScale(PCT_SCALE, ROUNDING);
+        } else {
+            priceVariancePct = priceVariance.abs()
+                    .divide(normPoPrice, INTERMEDIATE_SCALE, ROUNDING)
+                    .multiply(HUNDRED)
+                    .setScale(PCT_SCALE, ROUNDING);
+        }
 
-        // --- Độ lệch thành tiền (phục vụ amount_tolerance_abs) ---
-        BigDecimal invoiceAmount = in.invoiceAmount() != null
-                ? money(in.invoiceAmount())
-                : money(invoiceQty.multiply(invoicePrice));
-        BigDecimal expectedAmount = money(referenceQty.multiply(poPrice));
-        BigDecimal amountVariance = money(invoiceAmount.subtract(expectedAmount));
+        // 3. Chênh lệch thành tiền thực tế so với giá trị tham chiếu chuẩn
+        BigDecimal actualInvoiceAmount = normMatchedQty.multiply(normInvPrice);
+        BigDecimal expectedReferenceAmount = normRefQty.multiply(normPoPrice);
+        BigDecimal amountVariance = actualInvoiceAmount.subtract(expectedReferenceAmount)
+                .setScale(MONEY_SCALE, ROUNDING);
 
         return new VarianceResult(
-                referenceQty,
-                qtyVariance, qtyVariancePct,
-                priceVariance, priceVariancePct,
-                invoiceAmount, expectedAmount, amountVariance);
+                normRefQty,
+                qtyVariance,
+                qtyVariancePct,
+                priceVariance,
+                priceVariancePct,
+                amountVariance
+        );
     }
 
     /**
-     * Cộng dồn số lượng nhận từ nhiều GRN line (giao hàng từng phần) cho 1 dòng PO.
-     * Bỏ qua phần tử null.
+     * Đánh giá kết quả chênh lệch có nằm trong ngưỡng cho phép của TolerancePolicy hay không.
      */
-    public static BigDecimal sumQty(Collection<BigDecimal> quantities) {
-        if (quantities == null) return qty(BigDecimal.ZERO);
-        return qty(quantities.stream()
-                .filter(Objects::nonNull)
-                .reduce(BigDecimal.ZERO, BigDecimal::add));
-    }
-
-    // ------------------------------------------------------------------ helpers
-
-    /** variance / base × 100, null nếu base = 0 (không chia được). */
-    static BigDecimal percent(BigDecimal variance, BigDecimal base) {
-        if (base.signum() == 0) {
-            return variance.signum() == 0 ? BigDecimal.ZERO.setScale(PCT_SCALE) : null;
+    public boolean isWithinTolerance(VarianceResult result, ToleranceThreshold threshold) {
+        if (result == null || threshold == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "VarianceResult và ToleranceThreshold không được null");
         }
-        // chia với độ chính xác dư rồi mới làm tròn về PCT_SCALE để tránh sai số tích lũy
-        return variance.multiply(HUNDRED)
-                .divide(base, PCT_SCALE + 6, ROUNDING)
-                .setScale(PCT_SCALE, ROUNDING);
+
+        boolean qtyOk = result.qtyVariancePct().compareTo(threshold.qtyTolerancePct()) <= 0;
+        boolean priceOk = result.priceVariancePct().compareTo(threshold.priceTolerancePct()) <= 0;
+        boolean amountOk = threshold.amountToleranceAbs() == null
+                || result.amountVariance().abs().compareTo(threshold.amountToleranceAbs()) <= 0;
+
+        return qtyOk && priceOk && amountOk;
     }
 
-    static BigDecimal qty(BigDecimal v)   { return v.setScale(QTY_SCALE, ROUNDING); }
-    static BigDecimal money(BigDecimal v) { return v.setScale(MONEY_SCALE, ROUNDING); }
+    private void validateInputs(
+            BigDecimal matchedQty,
+            BigDecimal referenceQty,
+            BigDecimal invoiceUnitPrice,
+            BigDecimal poUnitPrice,
+            CurrencyCode invoiceCurrency,
+            CurrencyCode poCurrency
+    ) {
+        if (matchedQty == null || matchedQty.signum() <= 0) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Số lượng hóa đơn đối chiếu (matchedQty) phải lớn hơn 0");
+        }
+        if (referenceQty == null || referenceQty.signum() <= 0) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Số lượng tham chiếu (referenceQty) phải lớn hơn 0");
+        }
+        if (invoiceUnitPrice == null || invoiceUnitPrice.signum() < 0) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Đơn giá hóa đơn (invoiceUnitPrice) không được null hoặc âm");
+        }
+        if (poUnitPrice == null || poUnitPrice.signum() < 0) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Đơn giá PO (poUnitPrice) không được null hoặc âm");
+        }
+        if (invoiceCurrency != null && poCurrency != null && invoiceCurrency != poCurrency) {
+            throw new BusinessException(
+                    ErrorCode.VALIDATION_ERROR,
+                    String.format("Không thể đối chiếu lệch loại tiền tệ: hóa đơn (%s) và PO (%s)", invoiceCurrency, poCurrency)
+            );
+        }
+    }
 }

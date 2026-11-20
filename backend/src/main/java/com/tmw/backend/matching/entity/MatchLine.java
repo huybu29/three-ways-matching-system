@@ -1,45 +1,39 @@
 package com.tmw.backend.matching.entity;
 
 import com.tmw.backend.common.entity.BaseEntity;
+import com.tmw.backend.common.error.BusinessException;
+import com.tmw.backend.common.error.ErrorCode;
+import com.tmw.backend.matching.api.AllocationState;
 import com.tmw.backend.matching.variance.VarianceResult;
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.EnumType;
-import jakarta.persistence.Enumerated;
-import jakarta.persistence.FetchType;
-import jakarta.persistence.JoinColumn;
-import jakarta.persistence.ManyToOne;
-import jakarta.persistence.Table;
+import com.tmw.backend.matching.api.MatchType;
+import jakarta.persistence.*;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
-import java.util.Objects;
 import java.util.UUID;
 
-import static com.tmw.backend.matching.entity.DecimalScales.MONEY_SCALE;
-import static com.tmw.backend.matching.entity.DecimalScales.QTY_SCALE;
-import static com.tmw.backend.matching.entity.DecimalScales.ROUNDING;
+import static com.tmw.backend.common.decimal.DecimalScales.*;
 
-/**
- * Một dòng ghép: dòng hóa đơn ↔ dòng PO (↔ dòng GRN nếu 3-way).
- *
- * <p>Ghép 1-nhiều / nhiều-1 được biểu diễn bằng NHIỀU MatchLine trong cùng một proposal:
- * <ul>
- *   <li>1 dòng hóa đơn chia cho 2 dòng PO → 2 MatchLine cùng invoice_line_id</li>
- *   <li>2 dòng hóa đơn gom vào 1 dòng PO → 2 MatchLine cùng po_line_id</li>
- * </ul>
- */
 @Entity
-@Table(name = "match_lines")
+@Table(name = "match_line", uniqueConstraints = {
+        @UniqueConstraint(
+                name = "uk_match_line_match_inv_line_po_line",
+                columnNames = {"match_id", "invoice_line_id", "po_line_id"}
+        )
+})
+@Getter
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
 public class MatchLine extends BaseEntity {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "match_proposal_id", nullable = false)
-    private MatchProposal proposal;
+    @JoinColumn(name = "match_id", nullable = false)
+    private Match match;
 
     @Column(name = "line_no", nullable = false)
     private int lineNo;
 
-    // ---- Tham chiếu chứng từ (FK sang bảng của BE-3 / BE-4) ----
     @Column(name = "invoice_line_id", nullable = false)
     private UUID invoiceLineId;
 
@@ -49,7 +43,6 @@ public class MatchLine extends BaseEntity {
     @Column(name = "po_line_id", nullable = false)
     private UUID poLineId;
 
-    /** null với TWO_WAY. */
     @Column(name = "grn_line_id")
     private UUID grnLineId;
 
@@ -57,8 +50,6 @@ public class MatchLine extends BaseEntity {
     @Column(name = "match_type", nullable = false, length = 16)
     private MatchType matchType;
 
-    // ---- Số lượng / giá được ghép ----
-    /** Số lượng giữ chỗ trên Capacity của dòng PO. */
     @Column(name = "matched_qty", nullable = false, precision = 19, scale = QTY_SCALE)
     private BigDecimal matchedQty;
 
@@ -68,125 +59,118 @@ public class MatchLine extends BaseEntity {
     @Column(name = "po_unit_price", nullable = false, precision = 19, scale = MONEY_SCALE)
     private BigDecimal poUnitPrice;
 
-    /** Thành tiền giữ chỗ (chưa VAT) = matchedQty × invoiceUnitPrice. */
     @Column(name = "matched_amount", nullable = false, precision = 19, scale = MONEY_SCALE)
     private BigDecimal matchedAmount;
 
-    // ---- Kết quả tính độ lệch (VarianceCalculator) ----
     @Column(name = "reference_qty", precision = 19, scale = QTY_SCALE)
     private BigDecimal referenceQty;
 
     @Column(name = "qty_variance", precision = 19, scale = QTY_SCALE)
     private BigDecimal qtyVariance;
 
-    @Column(name = "qty_variance_pct", precision = 9, scale = DecimalScales.PCT_SCALE)
+    @Column(name = "qty_variance_pct", precision = 19, scale = PCT_SCALE)
     private BigDecimal qtyVariancePct;
 
     @Column(name = "price_variance", precision = 19, scale = MONEY_SCALE)
     private BigDecimal priceVariance;
 
-    @Column(name = "price_variance_pct", precision = 9, scale = DecimalScales.PCT_SCALE)
+    @Column(name = "price_variance_pct", precision = 19, scale = PCT_SCALE)
     private BigDecimal priceVariancePct;
 
     @Column(name = "amount_variance", precision = 19, scale = MONEY_SCALE)
     private BigDecimal amountVariance;
 
-    /** null = chưa đánh giá dung sai (gắn ở GĐ3 cùng BE-2). */
     @Column(name = "within_tolerance")
     private Boolean withinTolerance;
 
+    @Column(name = "confidence_score", precision = 5, scale = 4)
+    private BigDecimal confidenceScore;
+
     @Enumerated(EnumType.STRING)
-    @Column(name = "status", nullable = false, length = 16)
-    private MatchLineStatus status;
+    @Column(name = "allocation_state", nullable = false, length = 16)
+    private AllocationState allocationState;
 
-    protected MatchLine() { /* JPA */ }
-
-    public MatchLine(UUID invoiceLineId, UUID poId, UUID poLineId, UUID grnLineId,
-                     MatchType matchType, BigDecimal matchedQty,
-                     BigDecimal invoiceUnitPrice, BigDecimal poUnitPrice) {
-        this.invoiceLineId = Objects.requireNonNull(invoiceLineId, "invoiceLineId");
-        this.poId = Objects.requireNonNull(poId, "poId");
-        this.poLineId = Objects.requireNonNull(poLineId, "poLineId");
-        this.matchType = Objects.requireNonNull(matchType, "matchType");
+    public MatchLine(
+            UUID invoiceLineId,
+            UUID poId,
+            UUID poLineId,
+            UUID grnLineId,
+            MatchType matchType,
+            BigDecimal matchedQty,
+            BigDecimal invoiceUnitPrice,
+            BigDecimal poUnitPrice
+    ) {
+        if (invoiceLineId == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "invoiceLineId không được để trống");
+        }
+        if (poId == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "poId không được để trống");
+        }
+        if (poLineId == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "poLineId không được để trống");
+        }
+        if (matchType == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "matchType không được để trống");
+        }
         if (matchType == MatchType.THREE_WAY && grnLineId == null) {
-            throw new IllegalArgumentException("grnLineId is required for THREE_WAY match line");
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Đối chiếu 3 chiều (THREE_WAY) bắt buộc có grnLineId");
         }
-        this.grnLineId = grnLineId;
-
         if (matchedQty == null || matchedQty.signum() <= 0) {
-            throw new IllegalArgumentException("matchedQty must be > 0");
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Số lượng đối chiếu (matchedQty) phải lớn hơn 0");
         }
-        if (invoiceUnitPrice == null || invoiceUnitPrice.signum() < 0
-                || poUnitPrice == null || poUnitPrice.signum() < 0) {
-            throw new IllegalArgumentException("unit prices must be >= 0");
+        if (invoiceUnitPrice == null || invoiceUnitPrice.signum() < 0 || poUnitPrice == null || poUnitPrice.signum() < 0) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Đơn giá hóa đơn và đơn giá PO không được âm");
         }
+
+        this.invoiceLineId = invoiceLineId;
+        this.poId = poId;
+        this.poLineId = poLineId;
+        this.grnLineId = grnLineId;
+        this.matchType = matchType;
         this.matchedQty = matchedQty.setScale(QTY_SCALE, ROUNDING);
         this.invoiceUnitPrice = invoiceUnitPrice.setScale(MONEY_SCALE, ROUNDING);
         this.poUnitPrice = poUnitPrice.setScale(MONEY_SCALE, ROUNDING);
         this.matchedAmount = this.matchedQty.multiply(this.invoiceUnitPrice).setScale(MONEY_SCALE, ROUNDING);
-        this.status = MatchLineStatus.RESERVED;
+        this.allocationState = AllocationState.RESERVED;
     }
 
-    /** Gán kết quả từ VarianceCalculator. Reset within_tolerance vì số liệu đã đổi. */
-    public void applyVariance(VarianceResult r) {
-        Objects.requireNonNull(r, "variance result");
+    public void applyVariance(VarianceResult r, boolean withinTolerance) {
+        if (r == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Kết quả tính chênh lệch (VarianceResult) không được null");
+        }
         this.referenceQty = r.referenceQty();
         this.qtyVariance = r.qtyVariance();
         this.qtyVariancePct = r.qtyVariancePct();
         this.priceVariance = r.priceVariance();
         this.priceVariancePct = r.priceVariancePct();
         this.amountVariance = r.amountVariance();
-        this.withinTolerance = null;
+        this.withinTolerance = withinTolerance;
     }
 
-    /** Gọi ở GĐ3 sau khi ToleranceEvaluationService đánh giá. */
-    public void markTolerance(boolean within) {
-        this.withinTolerance = within;
+    public void assignConfidenceScore(BigDecimal score) {
+        if (score != null) {
+            this.confidenceScore = score.setScale(4, ROUNDING);
+        }
     }
 
-    // ---- package-private: chỉ MatchProposal được đổi trạng thái dòng ----
-    void attachTo(MatchProposal proposal, int lineNo) {
-        this.proposal = proposal;
+    void attachTo(Match match, int lineNo) {
+        this.match = match;
         this.lineNo = lineNo;
     }
 
     void release() {
-        if (status == MatchLineStatus.RESERVED) status = MatchLineStatus.RELEASED;
+        if (allocationState == AllocationState.RESERVED) {
+            allocationState = AllocationState.RELEASED;
+        }
     }
 
     void allocate() {
-        if (status != MatchLineStatus.RESERVED) {
-            throw new IllegalStateException("Only RESERVED line can be allocated, line " + getId() + " is " + status);
+        if (allocationState != AllocationState.RESERVED) {
+            throw new BusinessException(
+                    ErrorCode.INVALID_STATE_TRANSITION,
+                    "Chỉ dòng ở trạng thái RESERVED mới được chuyển sang ALLOCATED, dòng " + getId() + " hiện là " + allocationState
+            );
         }
-        status = MatchLineStatus.ALLOCATED;
+        allocationState = AllocationState.ALLOCATED;
     }
-
-    // ---- getters ----
-    public MatchProposal getProposal() { return proposal; }
-    public int getLineNo() { return lineNo; }
-    public UUID getInvoiceLineId() { return invoiceLineId; }
-    public UUID getPoId() { return poId; }
-    public UUID getPoLineId() { return poLineId; }
-    public UUID getGrnLineId() { return grnLineId; }
-    public MatchType getMatchType() { return matchType; }
-    public BigDecimal getMatchedQty() { return matchedQty; }
-    public BigDecimal getInvoiceUnitPrice() { return invoiceUnitPrice; }
-    public BigDecimal getPoUnitPrice() { return poUnitPrice; }
-    public BigDecimal getMatchedAmount() { return matchedAmount; }
-    public BigDecimal getReferenceQty() { return referenceQty; }
-    public BigDecimal getQtyVariance() { return qtyVariance; }
-    public BigDecimal getQtyVariancePct() { return qtyVariancePct; }
-    public BigDecimal getPriceVariance() { return priceVariance; }
-    public BigDecimal getPriceVariancePct() { return priceVariancePct; }
-    public BigDecimal getAmountVariance() { return amountVariance; }
-    public Boolean getWithinTolerance() { return withinTolerance; }
-    public MatchLineStatus getStatus() { return status; }
-
-    @Override
-    public boolean equals(Object o) {
-        return this == o || (o instanceof MatchLine other && getId() != null && getId().equals(other.getId()));
-    }
-
-    @Override
-    public int hashCode() { return MatchLine.class.hashCode(); }
 }

@@ -1,6 +1,6 @@
 package com.tmw.backend.matching.exception;
 
-import com.tmw.backend.matching.entity.MatchStatus;
+import com.tmw.backend.matching.api.MatchStatus;
 
 import java.util.UUID;
 

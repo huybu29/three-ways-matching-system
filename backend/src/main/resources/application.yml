@@ -18,3 +18,10 @@ spring:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
       password: ${REDIS_PASSWORD:twm_redis_2026}
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:tmw-three-way-matching-super-secret-key-2026-minimum-32-chars}
+    access-token-expiration-ms: 900000      # 15 phút
+    refresh-token-expiration-ms: 604800000  # 7 ngày
+    expiration-ms: 86400000                 # dự phòng nếu JwtTokenProvider dùng tên thuộc tính này

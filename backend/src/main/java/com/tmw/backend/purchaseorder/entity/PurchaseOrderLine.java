@@ -1,16 +1,24 @@
 package com.tmw.backend.purchaseorder.entity;
 
+import com.tmw.backend.common.entity.BaseEntity;
+import com.tmw.backend.common.error.BusinessException;
+import com.tmw.backend.common.error.ErrorCode;
 import jakarta.persistence.*;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+
 import java.math.BigDecimal;
-import java.util.UUID;
+import java.math.RoundingMode;
+import java.util.Locale;
 
 @Entity
-@Table(name = "purchase_order_lines")
-public class PurchaseOrderLine {
-
-    @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
-    private UUID id;
+@Table(name = "po_line", uniqueConstraints = {
+        @UniqueConstraint(name = "uk_po_line_po_id_line_no", columnNames = {"purchase_order_id", "line_no"})
+})
+@Getter
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+public class PurchaseOrderLine extends BaseEntity {
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "purchase_order_id", nullable = false)
@@ -19,10 +27,10 @@ public class PurchaseOrderLine {
     @Column(name = "line_no", nullable = false)
     private Integer lineNo;
 
-    @Column(name = "item_code", nullable = false)
+    @Column(name = "item_code", nullable = false, length = 100)
     private String itemCode;
 
-    @Column(name = "description")
+    @Column(name = "description", length = 500)
     private String description;
 
     @Column(name = "ordered_qty", nullable = false, precision = 19, scale = 4)
@@ -31,35 +39,59 @@ public class PurchaseOrderLine {
     @Column(name = "unit_price", nullable = false, precision = 19, scale = 4)
     private BigDecimal unitPrice;
 
-    @Column(name = "vat_rate", nullable = false, precision = 5, scale = 4)
+    @Column(name = "vat_rate", nullable = false, precision = 19, scale = 4)
     private BigDecimal vatRate;
 
-    @OneToOne(mappedBy = "poLine", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
-    private PoLineCapacity capacity;
-
-    public PurchaseOrderLine() {}
-
-    public UUID getId() { return id; }
-    public void setId(UUID id) { this.id = id; }
-    public PurchaseOrder getPurchaseOrder() { return purchaseOrder; }
-    public void setPurchaseOrder(PurchaseOrder purchaseOrder) { this.purchaseOrder = purchaseOrder; }
-    public Integer getLineNo() { return lineNo; }
-    public void setLineNo(Integer lineNo) { this.lineNo = lineNo; }
-    public String getItemCode() { return itemCode; }
-    public void setItemCode(String itemCode) { this.itemCode = itemCode; }
-    public String getDescription() { return description; }
-    public void setDescription(String description) { this.description = description; }
-    public BigDecimal getOrderedQty() { return orderedQty; }
-    public void setOrderedQty(BigDecimal orderedQty) { this.orderedQty = orderedQty; }
-    public BigDecimal getUnitPrice() { return unitPrice; }
-    public void setUnitPrice(BigDecimal unitPrice) { this.unitPrice = unitPrice; }
-    public BigDecimal getVatRate() { return vatRate; }
-    public void setVatRate(BigDecimal vatRate) { this.vatRate = vatRate; }
-    public PoLineCapacity getCapacity() { return capacity; }
-    public void setCapacity(PoLineCapacity capacity) {
-        this.capacity = capacity;
-        if (capacity != null) {
-            capacity.setPoLine(this);
+    public PurchaseOrderLine(
+            Integer lineNo,
+            String itemCode,
+            String description,
+            BigDecimal orderedQty,
+            BigDecimal unitPrice,
+            BigDecimal vatRate
+    ) {
+        if (lineNo == null || lineNo <= 0) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Số thứ tự dòng (line_no) phải lớn hơn 0");
         }
+        if (itemCode == null || itemCode.isBlank()) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Mã hàng hóa (item_code) không được để trống");
+        }
+        if (orderedQty == null || orderedQty.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Số lượng đặt (ordered_qty) phải lớn hơn 0");
+        }
+        if (unitPrice == null || unitPrice.compareTo(BigDecimal.ZERO) < 0) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Đơn giá (unit_price) không được âm");
+        }
+
+        BigDecimal normalizedVat = (vatRate != null ? vatRate : BigDecimal.ZERO)
+                .setScale(4, RoundingMode.HALF_UP);
+        if (normalizedVat.compareTo(BigDecimal.ZERO) < 0 || normalizedVat.compareTo(BigDecimal.ONE) > 0) {
+            throw new BusinessException(
+                    ErrorCode.VALIDATION_ERROR,
+                    "Thuế suất (vat_rate) phải nằm trong khoảng từ 0 đến 1 (ví dụ 0.10 cho 10%)"
+            );
+        }
+
+        this.lineNo = lineNo;
+        this.itemCode = itemCode.trim().toUpperCase(Locale.ROOT);
+        this.description = (description == null || description.isBlank()) ? null : description.trim();
+        this.orderedQty = orderedQty.setScale(4, RoundingMode.HALF_UP);
+        this.unitPrice = unitPrice.setScale(4, RoundingMode.HALF_UP);
+        this.vatRate = normalizedVat;
+    }
+
+    public void assignTo(PurchaseOrder purchaseOrder) {
+        this.purchaseOrder = purchaseOrder;
+    }
+
+    public BigDecimal getLineAmount() {
+        if (orderedQty == null || unitPrice == null) {
+            return BigDecimal.ZERO.setScale(4, RoundingMode.HALF_UP);
+        }
+        return orderedQty.multiply(unitPrice).setScale(4, RoundingMode.HALF_UP);
+    }
+
+    public BigDecimal getVatAmount() {
+        return getLineAmount().multiply(vatRate).setScale(4, RoundingMode.HALF_UP);
     }
 }

@@ -6,15 +6,12 @@ import java.util.UUID;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.tmw.backend.posting.entity.JournalEntry;
-
+import java.util.Objects;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-/**
- * Detailed DTO representation of an accounting JournalEntry.
- */
 @Data
 @Builder
 @NoArgsConstructor
@@ -58,11 +55,12 @@ public class JournalEntryResponse {
                 .matchId(entity.getMatchId())
                 .totalAmount(entity.getTotalAmount())
                 .vatAmount(entity.getVatAmount())
-                .paymentInstructionId(entity.getPaymentInstructionId())
+                .paymentInstructionId(Objects.toString(entity.getPaymentInstructionId(), null))
                 .postedBy(entity.getPostedBy())
                 .postedAt(entity.getPostedAt())
-                .createdAt(entity.getCreatedAt())
+                .createdAt(entity.getCreatedAt() != null
+                ? entity.getCreatedAt().atOffset(java.time.ZoneOffset.UTC)
+                : null)
                 .build();
     }
 }
-
