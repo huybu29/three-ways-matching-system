@@ -1,4 +1,4 @@
-package com.tmw.backend.matchexception;
+package com.tmw.backend.audit;
 
 import com.tmw.backend.common.error.BusinessException;
 import com.tmw.backend.common.error.ErrorCode;

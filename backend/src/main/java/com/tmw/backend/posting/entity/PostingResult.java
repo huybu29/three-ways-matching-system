@@ -1,4 +1,4 @@
-package com.tmw.backend.posting.api;
+package com.tmw.backend.posting.entity;
 
 import com.tmw.backend.common.enums.CurrencyCode;
 import com.tmw.backend.invoice.api.InvoiceStatus;
