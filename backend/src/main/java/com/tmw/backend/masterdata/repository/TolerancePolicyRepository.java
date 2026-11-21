@@ -15,6 +15,9 @@ import java.util.UUID;
 public interface TolerancePolicyRepository
         extends JpaRepository<TolerancePolicy, UUID>, JpaSpecificationExecutor<TolerancePolicy> {
 
+    /** Tất cả chính sách đang hiệu lực (dùng cho cache của ToleranceEvaluationService). */
+    List<TolerancePolicy> findByActiveTrue();
+
     Optional<TolerancePolicy> findFirstByIsDefaultTrue();
 
     boolean existsByIsDefaultTrue();

@@ -8,11 +8,13 @@ import com.tmw.backend.masterdata.service.TolerancePolicyService;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.http.ResponseEntity;
 import com.tmw.backend.common.pagination.CursorResponse;
@@ -45,5 +47,19 @@ public class TolerancePolicyController {
         return ResponseEntity.status(HttpStatus.CREATED)
                 .eTag("\"" + created.getVersion() + "\"")
                 .body(TolerancePolicyResponse.from(created));
+    }
+
+    /** If-Match thiếu -> 428 PRECONDITION_REQUIRED; không khớp version -> 412 VERSION_CONFLICT. */
+    @PutMapping("/{policyId}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<TolerancePolicyResponse> update(
+            @PathVariable UUID policyId,
+            @RequestHeader(value = "If-Match", required = false) String ifMatch,
+            @Valid @RequestBody TolerancePolicyRequest request
+    ) {
+        TolerancePolicy updated = service.update(policyId, ifMatch, request);
+        return ResponseEntity.ok()
+                .eTag("\"" + updated.getVersion() + "\"")
+                .body(TolerancePolicyResponse.from(updated));
     }
 }
