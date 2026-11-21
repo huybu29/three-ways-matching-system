@@ -1,31 +1,36 @@
 package com.tmw.backend.posting.repository;
 
-import java.util.Optional;
-import java.util.UUID;
-
+import com.tmw.backend.posting.entity.JournalEntry;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
-import com.tmw.backend.posting.entity.JournalEntry;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Repository for managing {@link JournalEntry} entities.
- * Note: Journal entries are immutable. Only insert and query operations are supported.
+ * Journal entries are accounting records; updates/deletes are forbidden by domain policy.
  */
 @Repository
 public interface JournalEntryRepository extends JpaRepository<JournalEntry, UUID> {
 
     Optional<JournalEntry> findByMatchId(UUID matchId);
 
-    
-    Optional<JournalEntry> findByJournalEntryId(String journalEntryId);
+    Optional<JournalEntry> findByInvoiceId(UUID invoiceId);
 
-   
+    Optional<JournalEntry> findByEntryNumber(String entryNumber);
+
+    Optional<JournalEntry> findByPaymentInstructionId(UUID paymentInstructionId);
+
+    List<JournalEntry> findBySupplierIdOrderByPostedAtDesc(UUID supplierId);
+
+    List<JournalEntry> findByPostingDateBetweenOrderByPostingDateAsc(LocalDate fromDate, LocalDate toDate);
+
     boolean existsByMatchId(UUID matchId);
 
-   
-    boolean existsByJournalEntryId(String journalEntryId);
+    boolean existsByInvoiceId(UUID invoiceId);
 
-    Optional<JournalEntry> findByPaymentInstructionId(String paymentInstructionId);
+    boolean existsByEntryNumber(String entryNumber);
 }
-
