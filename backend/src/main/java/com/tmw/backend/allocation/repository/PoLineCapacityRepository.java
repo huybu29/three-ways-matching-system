@@ -7,7 +7,8 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.Lock;
-
+import java.util.Collection;
+import java.util.List;
 
 import java.math.BigDecimal;
 import java.util.Optional;
@@ -18,6 +19,7 @@ public interface PoLineCapacityRepository extends JpaRepository<PoLineCapacity, 
     boolean existsByPoLineId(UUID poLineId);
 
     Optional<PoLineCapacity> findByPoLineId(UUID poLineId);
+    List<PoLineCapacity> findAllByPoLineIdIn(Collection<UUID> poLineIds);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
