@@ -25,6 +25,9 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ExceptionFactoryServiceImpl implements ExceptionFactoryService {
 
+    private static final UUID SYSTEM_ACTOR_ID =
+            UUID.fromString("00000000-0000-0000-0000-000000000000");
+
     private final MatchExceptionRepository exceptionRepository;
 
     @Override
@@ -59,7 +62,6 @@ public class ExceptionFactoryServiceImpl implements ExceptionFactoryService {
             );
             return exceptionRepository.saveAndFlush(created).toDto();
         } catch (DataIntegrityViolationException raceConditionEx) {
-            // Nếu 2 luồng đồng thời cùng chèn 1 ngoại lệ OPEN, tải lại bản ghi vừa được luồng kia tạo
             return exceptionRepository.findOpenByNaturalKey(
                             command.invoiceId(),
                             command.invoiceLineId(),
@@ -78,7 +80,6 @@ public class ExceptionFactoryServiceImpl implements ExceptionFactoryService {
             return List.of();
         }
 
-        // Gộp trùng ngay trong bộ nhớ theo khóa tự nhiên (giữ phần tử sau cùng mới nhất)
         Map<DeduplicationKey, CreateMatchExceptionCommand> deduplicated = new LinkedHashMap<>();
         for (CreateMatchExceptionCommand cmd : commands) {
             if (cmd != null) {
@@ -115,8 +116,10 @@ public class ExceptionFactoryServiceImpl implements ExceptionFactoryService {
                 ? "Tự động đóng ngoại lệ do hoàn tác hoặc hủy hóa đơn"
                 : reason.trim();
 
+        UUID effectiveActorId = (actorId != null) ? actorId : SYSTEM_ACTOR_ID;
+
         for (MatchException ex : openList) {
-            ex.waive(actorId, closeNote);
+            ex.waive(effectiveActorId, closeNote);
         }
         exceptionRepository.saveAllAndFlush(openList);
         return openList.size();

@@ -1,5 +1,6 @@
 package com.tmw.backend.purchaseorder.service;
 
+import com.tmw.backend.audit.api.Audited;
 import com.tmw.backend.purchaseorder.api.PurchaseOrderLineCreated;
 import com.tmw.backend.purchaseorder.entity.PurchaseOrder;
 import com.tmw.backend.purchaseorder.entity.PurchaseOrderLine;
@@ -17,6 +18,7 @@ public class PurchaseOrderService {
     private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
+    @Audited(entityType = "PURCHASE_ORDER", action = "CREATE")
     public PurchaseOrder createOrder(PurchaseOrder po) {
         // 1. Lưu và flush để có po_line.id trong DB trước khi bắn event
         PurchaseOrder savedPo = purchaseOrderRepository.saveAndFlush(po);

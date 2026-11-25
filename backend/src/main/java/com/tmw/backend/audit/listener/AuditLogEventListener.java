@@ -14,8 +14,10 @@ public class AuditLogEventListener {
 
     private final AuditLogRepository auditLogRepository;
 
-    @TransactionalEventListener(phase = TransactionPhase.BEFORE_COMMIT)
+    @TransactionalEventListener(phase = TransactionPhase.BEFORE_COMMIT, fallbackExecution = true)
     public void onAuditLogCaptured(AuditLogCapturedEvent event) {
+
+
         AuditLog logEntry = AuditLog.builder()
                 .occurredAt(event.occurredAt())
                 .actorId(event.actorId())
