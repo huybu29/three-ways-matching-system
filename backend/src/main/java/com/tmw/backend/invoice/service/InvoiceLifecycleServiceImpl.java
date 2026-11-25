@@ -1,5 +1,6 @@
 package com.tmw.backend.invoice.service;
 
+import com.tmw.backend.audit.api.Audited;
 import com.tmw.backend.common.error.BusinessException;
 import com.tmw.backend.common.error.ErrorCode;
 import com.tmw.backend.invoice.api.InvoiceLifecycleApi;
@@ -52,12 +53,14 @@ public class InvoiceLifecycleServiceImpl implements InvoiceLifecycleApi {
 
     @Override
     @Transactional
+    @Audited(entityType = "INVOICE", action = "REJECT_DUPLICATE", entityId = "#invoiceId")
     public InvoiceLifecycleSnapshot markRejected(UUID invoiceId, String reason) {
         return executeTransition(invoiceId, invoice -> stateMachine.markRejected(invoice, reason));
     }
 
     @Override
     @Transactional
+    @Audited(entityType = "INVOICE", action = "VOID", entityId = "#invoiceId")
     public InvoiceLifecycleSnapshot markVoid(UUID invoiceId, String reason) {
         return executeTransition(invoiceId, invoice -> stateMachine.markVoid(invoice, reason));
     }

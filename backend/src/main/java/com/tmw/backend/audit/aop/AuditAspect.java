@@ -1,7 +1,8 @@
 package com.tmw.backend.audit.aop;
 
+import com.tmw.backend.audit.api.AuditContext;
 import com.tmw.backend.audit.api.AuditContextHolder;
-import com.tmw.backend.audit.api.AuditLogPublisher;
+import com.tmw.backend.audit.api.AuditLogCapturedEvent;
 import com.tmw.backend.audit.api.Audited;
 import com.tmw.backend.common.error.BusinessException;
 import com.tmw.backend.common.error.ErrorCode;
@@ -10,6 +11,7 @@ import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.expression.MethodBasedEvaluationContext;
 import org.springframework.core.DefaultParameterNameDiscoverer;
 import org.springframework.core.Ordered;
@@ -20,6 +22,7 @@ import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.stereotype.Component;
 
 import java.lang.reflect.Method;
+import java.time.Instant;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -30,7 +33,7 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class AuditAspect {
 
-    private final AuditLogPublisher auditLogPublisher;
+    private final ApplicationEventPublisher eventPublisher;
     private final AuditSnapshotMapper snapshotMapper;
 
     private final ExpressionParser spelParser = new SpelExpressionParser();
@@ -38,6 +41,8 @@ public class AuditAspect {
 
     @Around("@annotation(audited)")
     public Object aroundAuditedMethod(ProceedingJoinPoint joinPoint, Audited audited) throws Throwable {
+        System.out.println("AUDIT ASPECT TRIGGERED: " + joinPoint.getSignature().toShortString());
+
         MethodSignature signature = (MethodSignature) joinPoint.getSignature();
         Method method = signature.getMethod();
         Object[] args = joinPoint.getArgs();
@@ -47,7 +52,6 @@ public class AuditAspect {
         MethodBasedEvaluationContext evalContext =
                 new MethodBasedEvaluationContext(joinPoint.getTarget(), method, args, nameDiscoverer);
 
-        // 1. Chụp before_data TRƯỚC khi proceed() làm thay đổi trạng thái object
         Map<String, Object> beforeData = captureBeforeState(audited, evalContext);
 
         Object result;
@@ -56,7 +60,6 @@ public class AuditAspect {
             result = joinPoint.proceed();
             manualBefore = AuditContextHolder.consumeManualBeforeSnapshot();
         } finally {
-            // Đảm bảo dọn ThreadLocal kể cả khi phương thức nghiệp vụ ném exception
             AuditContextHolder.consumeManualBeforeSnapshot();
         }
 
@@ -66,20 +69,26 @@ public class AuditAspect {
 
         evalContext.setVariable("result", result);
 
-        // 2. Trích xuất entityId và chụp after_data
         UUID entityId = resolveEntityId(audited, entityType, evalContext, args, result);
         Map<String, Object> afterData = isHardDeleteAction(audited.action())
                 ? null
                 : snapshotMapper.toSnapshotMap(result);
 
-        // 3. Phát sự kiện để AuditLogEventListener lưu ở pha BEFORE_COMMIT
-        auditLogPublisher.publish(
-                entityType,
+
+
+        AuditContext ctx = AuditContextHolder.getContextOrFallback();
+        eventPublisher.publishEvent(new AuditLogCapturedEvent(
+                Instant.now(),
+                ctx.actorId(),
+                ctx.actorRoles(),
                 audited.action(),
+                entityType,
                 entityId,
                 beforeData,
-                afterData
-        );
+                afterData,
+                ctx.requestId(),
+                ctx.ipAddress()
+        ));
 
         return result;
     }
@@ -149,7 +158,6 @@ public class AuditAspect {
             Method recordAccessor = target.getClass().getMethod("id");
             return coerceToUuid(recordAccessor.invoke(target));
         } catch (ReflectiveOperationException ignored) {
-            // Thử tiếp getter chuẩn JavaBean
         }
         try {
             Method getter = target.getClass().getMethod("getId");
