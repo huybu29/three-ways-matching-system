@@ -1,0 +1,1544 @@
+From a3da845663a5747fdc8f267bac5f8c4e5b7e9938 Mon Sep 17 00:00:00 2001
+From: BE-5 <be5@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:42:32 +0000
+Subject: [PATCH] =?UTF-8?q?fix(matching):=20tr=E1=BA=A3=20n=E1=BB=A3=20gia?=
+ =?UTF-8?q?i=20=C4=91o=E1=BA=A1n=201=20c=E1=BB=A7a=20BE-5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Migration mới V202611270140__matching_create_match_tables.sql khớp 1-1 entity Match/MatchLine
+  (chạy được với ddl-auto=validate), kèm partial unique index uk_match_active_invoice
+  (mỗi hóa đơn tối đa 1 match PROPOSED/APPROVED). Xóa V1_0_5 cũ (sai tên bảng/cột).
+- Match: thêm approved_at, posted_at, reject_reason; lý do reject/cancel không còn ghi đè summary_reason.
+- Match MANUAL có overall_confidence = null; AUTO bắt buộc 0..1 (khớp check constraint).
+- allocation_state nhất quán: MatchLine mới ở NONE, Match.markReserved/Allocated/Released
+  chuyển đồng loạt cả Match và mọi dòng; không cho thêm dòng sau khi đã giữ chỗ.
+- Xóa MatchLineStatus (trùng AllocationState) và InvalidStateTransitionException
+  (trùng BusinessException(INVALID_STATE_TRANSITION)).
+- VarianceCalculator: referenceQty = 0 không còn ném lỗi; trả qtyVariancePct = null và
+  VarianceResult.missingReferenceQty() = true để engine sinh MISSING_GRN.
+- ConfidenceScorer: tiêu chí po_reference so theo chuỗi số PO (po_number), không phân biệt hoa/thường.
+- MatchStateMachine nhận Clock để ghi approved_at/posted_at.
+- Viết MatchPartialUniqueIndexIntegrationTest (trước đó là file rỗng) dùng PostgresContainerBase.
+- MatchProposal giữ constructor cũ để code/test của BE-6 không phải sửa.
+
+Không đổi: Match vẫn dùng @Version Long (7/9 entity trong repo dùng Long, chưa entity nào kế thừa VersionedEntity).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FuiRsK6QKFR8zMZDjCFKWD
+---
+ .../backend/matching/api/MatchLineStatus.java |  32 ---
+ .../backend/matching/api/MatchProposal.java   |  38 +++-
+ .../tmw/backend/matching/api/MatchStatus.java |   3 -
+ .../matching/dto/MatchProposalResponse.java   |   7 +
+ .../tmw/backend/matching/entity/Match.java    | 154 +++++++++----
+ .../backend/matching/entity/MatchLine.java    |  22 +-
+ .../InvalidStateTransitionException.java      |  38 ----
+ .../matching/scoring/ConfidenceInput.java     |  14 +-
+ .../matching/scoring/ConfidenceScorer.java    |  25 ++-
+ .../matching/service/MatchStateMachine.java   |  21 +-
+ .../matching/strategy/MatchingContext.java    |   3 +-
+ .../matching/variance/VarianceCalculator.java |  20 +-
+ .../matching/variance/VarianceResult.java     |  17 +-
+ .../migration/V1_0_5__create_match_tables.sql | 109 ---------
+ ...11270140__matching_create_match_tables.sql | 117 ++++++++++
+ ...atchPartialUniqueIndexIntegrationTest.java | 208 ++++++++++++++++++
+ .../matching/entity/MatchDomainUnitTest.java  |  68 +++++-
+ .../scoring/ConfidenceScorerUnitTest.java     |  36 ++-
+ .../MatchStateMachineMatrixUnitTest.java      |  18 +-
+ .../variance/VarianceCalculatorUnitTest.java  |  34 ++-
+ 20 files changed, 729 insertions(+), 255 deletions(-)
+ delete mode 100644 backend/src/main/java/com/tmw/backend/matching/api/MatchLineStatus.java
+ delete mode 100644 backend/src/main/java/com/tmw/backend/matching/exception/InvalidStateTransitionException.java
+ delete mode 100644 backend/src/main/resources/db/migration/V1_0_5__create_match_tables.sql
+ create mode 100644 backend/src/main/resources/db/migration/V202611270140__matching_create_match_tables.sql
+
+diff --git a/backend/src/main/java/com/tmw/backend/matching/api/MatchLineStatus.java b/backend/src/main/java/com/tmw/backend/matching/api/MatchLineStatus.java
+deleted file mode 100644
+index 0cfa3d1..0000000
+--- a/backend/src/main/java/com/tmw/backend/matching/api/MatchLineStatus.java
++++ /dev/null
+@@ -1,32 +0,0 @@
+-package com.tmw.backend.matching.api;
+-
+-import java.util.Collections;
+-import java.util.EnumSet;
+-import java.util.Set;
+-
+-public enum MatchLineStatus {
+-
+-    RESERVED,
+-    ALLOCATED,
+-    RELEASED;
+-
+-    public Set<MatchLineStatus> allowedNextStates() {
+-        EnumSet<MatchLineStatus> next = switch (this) {
+-            case RESERVED -> EnumSet.of(ALLOCATED, RELEASED);
+-            case ALLOCATED, RELEASED -> EnumSet.noneOf(MatchLineStatus.class);
+-        };
+-        return Collections.unmodifiableSet(next);
+-    }
+-
+-    public boolean canTransitionTo(MatchLineStatus target) {
+-        return target != null && allowedNextStates().contains(target);
+-    }
+-
+-    public boolean isTerminal() {
+-        return allowedNextStates().isEmpty();
+-    }
+-
+-    public boolean holdsCapacity() {
+-        return this == RESERVED || this == ALLOCATED;
+-    }
+-}
+\ No newline at end of file
+diff --git a/backend/src/main/java/com/tmw/backend/matching/api/MatchProposal.java b/backend/src/main/java/com/tmw/backend/matching/api/MatchProposal.java
+index 9d55141..eb11c81 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/api/MatchProposal.java
++++ b/backend/src/main/java/com/tmw/backend/matching/api/MatchProposal.java
+@@ -1,9 +1,16 @@
+ package com.tmw.backend.matching.api;
+ 
+ import java.math.BigDecimal;
++import java.time.Instant;
+ import java.util.List;
+ import java.util.UUID;
+ 
++/**
++ * Snapshot chỉ-đọc của một Match, dùng cho các module khác (BE-6 SoDGuard / Posting, BE-7 ...).
++ *
++ * @param overallConfidence null với Match MANUAL
++ * @param rejectReason      lý do khi Match ở REJECTED hoặc CANCELLED
++ */
+ public record MatchProposal(
+         UUID id,
+         UUID invoiceId,
+@@ -16,10 +23,39 @@ public record MatchProposal(
+         String summaryReason,
+         UUID proposedBy,
+         UUID approvedBy,
++        Instant approvedAt,
+         UUID postedBy,
++        Instant postedAt,
++        String rejectReason,
+         Long version,
+         List<MatchLineProposal> lines
+ ) {
++
++    /**
++     * Constructor cũ (không có approvedAt/postedAt/rejectReason) – giữ lại để code và test
++     * hiện có của các module khác (vd. SoDGuardMatrixUnitTest của BE-6) không phải sửa.
++     */
++    public MatchProposal(
++            UUID id,
++            UUID invoiceId,
++            MatchStatus status,
++            MatchSource source,
++            AllocationState allocationState,
++            BigDecimal overallConfidence,
++            UUID tolerancePolicyId,
++            boolean hasVarianceException,
++            String summaryReason,
++            UUID proposedBy,
++            UUID approvedBy,
++            UUID postedBy,
++            Long version,
++            List<MatchLineProposal> lines
++    ) {
++        this(id, invoiceId, status, source, allocationState, overallConfidence, tolerancePolicyId,
++                hasVarianceException, summaryReason, proposedBy, approvedBy, null, postedBy, null, null,
++                version, lines);
++    }
++
+     public record MatchLineProposal(
+             UUID id,
+             UUID invoiceLineId,
+@@ -38,4 +74,4 @@ public record MatchProposal(
+             boolean withinTolerance
+     ) {
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/main/java/com/tmw/backend/matching/api/MatchStatus.java b/backend/src/main/java/com/tmw/backend/matching/api/MatchStatus.java
+index 531dbeb..7676ee2 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/api/MatchStatus.java
++++ b/backend/src/main/java/com/tmw/backend/matching/api/MatchStatus.java
+@@ -35,7 +35,4 @@ public enum MatchStatus {
+     public boolean requiresReason() {
+         return this == REJECTED || this == CANCELLED;
+     }
+-    public Set<MatchStatus> allowedNext() {
+-    return allowedNextStates();
+-}
+ }
+\ No newline at end of file
+diff --git a/backend/src/main/java/com/tmw/backend/matching/dto/MatchProposalResponse.java b/backend/src/main/java/com/tmw/backend/matching/dto/MatchProposalResponse.java
+index 2030a79..2313669 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/dto/MatchProposalResponse.java
++++ b/backend/src/main/java/com/tmw/backend/matching/dto/MatchProposalResponse.java
+@@ -9,6 +9,7 @@ import com.tmw.backend.matching.api.MatchStatus;
+ 
+ import java.math.BigDecimal;
+ import java.math.RoundingMode;
++import java.time.Instant;
+ import java.util.List;
+ import java.util.Objects;
+ import java.util.UUID;
+@@ -25,7 +26,10 @@ public record MatchProposalResponse(
+         String summaryReason,
+         UUID proposedBy,
+         UUID approvedBy,
++        Instant approvedAt,
+         UUID postedBy,
++        Instant postedAt,
++        String rejectReason,
+         int lineCount,
+         int exceptionLineCount,
+         BigDecimal totalMatchedAmount,
+@@ -66,7 +70,10 @@ public record MatchProposalResponse(
+                 proposal.summaryReason(),
+                 proposal.proposedBy(),
+                 proposal.approvedBy(),
++                proposal.approvedAt(),
+                 proposal.postedBy(),
++                proposal.postedAt(),
++                proposal.rejectReason(),
+                 lineResponses.size(),
+                 exceptionCount,
+                 totalAmount,
+diff --git a/backend/src/main/java/com/tmw/backend/matching/entity/Match.java b/backend/src/main/java/com/tmw/backend/matching/entity/Match.java
+index 71b7123..5dd5238 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/entity/Match.java
++++ b/backend/src/main/java/com/tmw/backend/matching/entity/Match.java
+@@ -14,17 +14,34 @@ import lombok.NoArgsConstructor;
+ 
+ import java.math.BigDecimal;
+ import java.math.RoundingMode;
++import java.time.Instant;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.UUID;
+ 
++/**
++ * Đề xuất đối chiếu cho MỘT hóa đơn (aggregate root của MatchLine).
++ *
++ * <p>Quy ước trạng thái giữ chỗ (allocation_state) – Match và mọi MatchLine luôn cùng một giá trị:
++ * <pre>
++ *   NONE ──markReserved()──▶ RESERVED ──markAllocated()──▶ ALLOCATED
++ *                               └────────markReleased()──▶ RELEASED
++ * </pre>
++ * Dòng mới thêm vào luôn ở NONE; chỉ được thêm dòng khi Match còn ở NONE
++ * (tức là trước khi gọi CapacityAllocationService.reserve của BE-3).</p>
++ *
++ * <p>Ràng buộc "mỗi hóa đơn chỉ có tối đa 1 Match đang hoạt động (PROPOSED/APPROVED)" được
++ * đảm bảo ở DB bằng partial unique index {@code uk_match_active_invoice}.</p>
++ */
+ @Entity
+ @Table(name = "match")
+ @Getter
+ @NoArgsConstructor(access = AccessLevel.PROTECTED)
+ public class Match extends BaseEntity {
+ 
++    private static final int SCORE_SCALE = 4;
++
+     @Column(name = "invoice_id", nullable = false)
+     private UUID invoiceId;
+ 
+@@ -40,8 +57,9 @@ public class Match extends BaseEntity {
+     @Column(name = "allocation_state", nullable = false, length = 20)
+     private AllocationState allocationState = AllocationState.NONE;
+ 
+-    @Column(name = "overall_confidence", nullable = false, precision = 5, scale = 4)
+-    private BigDecimal overallConfidence = BigDecimal.ZERO.setScale(4, RoundingMode.HALF_UP);
++    /** 0..1 với AUTO; luôn null với MANUAL (người dùng tự ghép nên không có điểm tin cậy). */
++    @Column(name = "overall_confidence", precision = 5, scale = SCORE_SCALE)
++    private BigDecimal overallConfidence;
+ 
+     @Column(name = "tolerance_policy_id")
+     private UUID tolerancePolicyId;
+@@ -49,6 +67,7 @@ public class Match extends BaseEntity {
+     @Column(name = "has_variance_exception", nullable = false)
+     private boolean hasVarianceException = false;
+ 
++    /** Tóm tắt do engine sinh ra (vd: "2/3 dòng lệch giá"). Không dùng để lưu lý do reject/cancel. */
+     @Column(name = "summary_reason", length = 500)
+     private String summaryReason;
+ 
+@@ -58,14 +77,25 @@ public class Match extends BaseEntity {
+     @Column(name = "approved_by")
+     private UUID approvedBy;
+ 
++    @Column(name = "approved_at")
++    private Instant approvedAt;
++
+     @Column(name = "posted_by")
+     private UUID postedBy;
+ 
++    @Column(name = "posted_at")
++    private Instant postedAt;
++
++    /** Lý do khi chuyển sang REJECTED hoặc CANCELLED (bắt buộc ở cả hai trường hợp). */
++    @Column(name = "reject_reason", length = 500)
++    private String rejectReason;
++
+     @Version
+     @Column(name = "version", nullable = false)
+     private Long version;
+ 
+     @OneToMany(mappedBy = "match", cascade = CascadeType.ALL, orphanRemoval = true)
++    @OrderBy("lineNo ASC")
+     private List<MatchLine> lines = new ArrayList<>();
+ 
+     public Match(
+@@ -86,7 +116,7 @@ public class Match extends BaseEntity {
+         this.status = MatchStatus.PROPOSED;
+         this.allocationState = AllocationState.NONE;
+         this.tolerancePolicyId = tolerancePolicyId;
+-        this.overallConfidence = normalizeScore(overallConfidence);
++        this.overallConfidence = normalizeConfidence(this.source, overallConfidence);
+         this.proposedBy = proposedBy;
+     }
+ 
+@@ -94,11 +124,19 @@ public class Match extends BaseEntity {
+         return Collections.unmodifiableList(lines);
+     }
+ 
++    // ================================================================ lines
++
+     public void addLine(MatchLine line) {
+         assertMutable();
+         if (line == null) {
+             throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Dòng đối chiếu (MatchLine) không được null");
+         }
++        if (this.allocationState != AllocationState.NONE) {
++            throw new BusinessException(
++                    ErrorCode.INVALID_STATE_TRANSITION,
++                    "Không thể thêm dòng khi Match đã giữ chỗ hạn mức (allocationState = " + allocationState + ")"
++            );
++        }
+         boolean duplicatePair = lines.stream().anyMatch(existing ->
+                 existing.getInvoiceLineId().equals(line.getInvoiceLineId())
+                         && existing.getPoLineId().equals(line.getPoLineId())
+@@ -124,62 +162,87 @@ public class Match extends BaseEntity {
+                 .anyMatch(l -> Boolean.FALSE.equals(l.getWithinTolerance()));
+     }
+ 
++    /** Engine ghi tóm tắt kết quả đối chiếu (không liên quan tới lý do reject/cancel). */
++    public void updateSummaryReason(String summary) {
++        assertMutable();
++        this.summaryReason = (summary == null || summary.isBlank()) ? null : summary.trim();
++    }
++
++    // ================================================================ allocation
++
++    /** Gọi sau khi BE-3 giữ chỗ thành công cho toàn bộ dòng: NONE → RESERVED (Match và mọi dòng). */
+     public void markReserved() {
+         assertMutable();
+-        if (this.allocationState != AllocationState.NONE) {
+-            throw new BusinessException(
+-                    ErrorCode.INVALID_STATE_TRANSITION,
+-                    "Chỉ có thể giữ chỗ hạn mức khi allocationState đang ở NONE"
+-            );
+-        }
++        requireAllocationState(AllocationState.NONE, AllocationState.RESERVED);
++        lines.forEach(MatchLine::reserve);
+         this.allocationState = AllocationState.RESERVED;
+     }
+ 
++    /** Gọi trong cùng transaction với lệnh Post (commitAllocation): RESERVED → ALLOCATED. */
+     public void markAllocated() {
+         assertMutable();
+-        if (this.allocationState != AllocationState.RESERVED) {
+-            throw new BusinessException(
+-                    ErrorCode.INVALID_STATE_TRANSITION,
+-                    "Chỉ có thể chốt phân bổ (ALLOCATED) khi đang giữ chỗ (RESERVED)"
+-            );
+-        }
+-        for (MatchLine line : lines) {
+-            line.allocate();
+-        }
++        requireAllocationState(AllocationState.RESERVED, AllocationState.ALLOCATED);
++        lines.forEach(MatchLine::allocate);
+         this.allocationState = AllocationState.ALLOCATED;
+     }
+ 
++    /** Gọi sau khi BE-3 hoàn hạn mức (reject/cancel): RESERVED → RELEASED. */
+     public void markReleased() {
+         assertMutable();
+-        if (this.allocationState != AllocationState.RESERVED) {
++        requireAllocationState(AllocationState.RESERVED, AllocationState.RELEASED);
++        lines.forEach(MatchLine::release);
++        this.allocationState = AllocationState.RELEASED;
++    }
++
++    private void requireAllocationState(AllocationState expected, AllocationState target) {
++        if (this.allocationState != expected) {
+             throw new BusinessException(
+                     ErrorCode.INVALID_STATE_TRANSITION,
+-                    "Chỉ có thể giải phóng (RELEASED) khi đang giữ chỗ (RESERVED)"
++                    String.format("Chỉ có thể chuyển hạn mức sang %s khi đang ở %s (hiện tại: %s)",
++                            target, expected, allocationState)
+             );
+         }
+-        for (MatchLine line : lines) {
+-            line.release();
+-        }
+-        this.allocationState = AllocationState.RELEASED;
+     }
+ 
++    // ================================================================ lifecycle
++
+     /**
+-     * Chỉ được gọi thông qua MatchStateMachine để đảm bảo tuân thủ ma trận trạng thái.
++     * Chỉ được gọi thông qua MatchStateMachine (đã kiểm tra ma trận trạng thái, actor và reason).
+      */
+-    public void applyTransition(MatchStatus targetStatus, UUID actorId, String reason) {
++    public void applyTransition(MatchStatus targetStatus, UUID actorId, String reason, Instant at) {
+         assertMutable();
+         if (targetStatus == null) {
+             throw new BusinessException(ErrorCode.INVALID_STATE_TRANSITION, "Trạng thái đích không được null");
+         }
+-        if (targetStatus == MatchStatus.APPROVED) {
+-            this.approvedBy = actorId;
+-        } else if (targetStatus == MatchStatus.POSTED) {
+-            this.postedBy = actorId;
++        if (at == null) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Thời điểm chuyển trạng thái không được null");
+         }
+-        this.status = targetStatus;
+-        if (reason != null && !reason.isBlank()) {
+-            this.summaryReason = reason.trim();
++        switch (targetStatus) {
++            case APPROVED -> {
++                this.approvedBy = actorId;
++                this.approvedAt = at;
++            }
++            case POSTED -> {
++                this.postedBy = actorId;
++                this.postedAt = at;
++            }
++            case REJECTED, CANCELLED -> {
++                if (reason == null || reason.isBlank()) {
++                    throw new BusinessException(
++                            ErrorCode.VALIDATION_ERROR,
++                            "Bắt buộc nhập lý do khi chuyển Match sang " + targetStatus
++                    );
++                }
++                this.rejectReason = reason.trim();
++            }
++            default -> { /* PROPOSED: không có dữ liệu đi kèm */ }
+         }
++        this.status = targetStatus;
++    }
++
++    /** Tiện cho unit test / code cũ: dùng thời điểm hiện tại. */
++    public void applyTransition(MatchStatus targetStatus, UUID actorId, String reason) {
++        applyTransition(targetStatus, actorId, reason, Instant.now());
+     }
+ 
+     public void assertMutable() {
+@@ -191,6 +254,8 @@ public class Match extends BaseEntity {
+         }
+     }
+ 
++    // ================================================================ mapping
++
+     public MatchProposal toProposal() {
+         List<MatchProposal.MatchLineProposal> lineProposals = lines.stream()
+                 .map(l -> new MatchProposal.MatchLineProposal(
+@@ -224,15 +289,30 @@ public class Match extends BaseEntity {
+                 summaryReason,
+                 proposedBy,
+                 approvedBy,
++                approvedAt,
+                 postedBy,
++                postedAt,
++                rejectReason,
+                 version,
+                 lineProposals
+         );
+     }
+ 
+-    private static BigDecimal normalizeScore(BigDecimal score) {
++    private static BigDecimal normalizeConfidence(MatchSource source, BigDecimal score) {
++        if (source == MatchSource.MANUAL) {
++            if (score != null) {
++                throw new BusinessException(
++                        ErrorCode.VALIDATION_ERROR,
++                        "Match MANUAL không có điểm tin cậy (overall_confidence phải để trống)"
++                );
++            }
++            return null;
++        }
+         if (score == null) {
+-            return BigDecimal.ZERO.setScale(4, RoundingMode.HALF_UP);
++            throw new BusinessException(
++                    ErrorCode.VALIDATION_ERROR,
++                    "Match AUTO bắt buộc có điểm tin cậy (overall_confidence)"
++            );
+         }
+         if (score.compareTo(BigDecimal.ZERO) < 0 || score.compareTo(BigDecimal.ONE) > 0) {
+             throw new BusinessException(
+@@ -240,6 +320,6 @@ public class Match extends BaseEntity {
+                     "Điểm tin cậy (overall_confidence) phải nằm trong khoảng từ 0 đến 1"
+             );
+         }
+-        return score.setScale(4, RoundingMode.HALF_UP);
++        return score.setScale(SCORE_SCALE, RoundingMode.HALF_UP);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/main/java/com/tmw/backend/matching/entity/MatchLine.java b/backend/src/main/java/com/tmw/backend/matching/entity/MatchLine.java
+index 664f086..5be9701 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/entity/MatchLine.java
++++ b/backend/src/main/java/com/tmw/backend/matching/entity/MatchLine.java
+@@ -131,7 +131,8 @@ public class MatchLine extends BaseEntity {
+         this.invoiceUnitPrice = invoiceUnitPrice.setScale(MONEY_SCALE, ROUNDING);
+         this.poUnitPrice = poUnitPrice.setScale(MONEY_SCALE, ROUNDING);
+         this.matchedAmount = this.matchedQty.multiply(this.invoiceUnitPrice).setScale(MONEY_SCALE, ROUNDING);
+-        this.allocationState = AllocationState.RESERVED;
++        // Dòng mới chưa giữ chỗ hạn mức; Match.markReserved() sẽ chuyển đồng loạt sang RESERVED.
++        this.allocationState = AllocationState.NONE;
+     }
+ 
+     public void applyVariance(VarianceResult r, boolean withinTolerance) {
+@@ -158,19 +159,26 @@ public class MatchLine extends BaseEntity {
+         this.lineNo = lineNo;
+     }
+ 
++    void reserve() {
++        transitionAllocation(AllocationState.NONE, AllocationState.RESERVED);
++    }
++
+     void release() {
+-        if (allocationState == AllocationState.RESERVED) {
+-            allocationState = AllocationState.RELEASED;
+-        }
++        transitionAllocation(AllocationState.RESERVED, AllocationState.RELEASED);
+     }
+ 
+     void allocate() {
+-        if (allocationState != AllocationState.RESERVED) {
++        transitionAllocation(AllocationState.RESERVED, AllocationState.ALLOCATED);
++    }
++
++    private void transitionAllocation(AllocationState expected, AllocationState target) {
++        if (allocationState != expected) {
+             throw new BusinessException(
+                     ErrorCode.INVALID_STATE_TRANSITION,
+-                    "Chỉ dòng ở trạng thái RESERVED mới được chuyển sang ALLOCATED, dòng " + getId() + " hiện là " + allocationState
++                    "Dòng đối chiếu " + getId() + " chỉ chuyển sang " + target
++                            + " khi đang ở " + expected + " (hiện tại: " + allocationState + ")"
+             );
+         }
+-        allocationState = AllocationState.ALLOCATED;
++        allocationState = target;
+     }
+ }
+\ No newline at end of file
+diff --git a/backend/src/main/java/com/tmw/backend/matching/exception/InvalidStateTransitionException.java b/backend/src/main/java/com/tmw/backend/matching/exception/InvalidStateTransitionException.java
+deleted file mode 100644
+index 367aab6..0000000
+--- a/backend/src/main/java/com/tmw/backend/matching/exception/InvalidStateTransitionException.java
++++ /dev/null
+@@ -1,38 +0,0 @@
+-package com.tmw.backend.matching.exception;
+-
+-import com.tmw.backend.matching.api.MatchStatus;
+-
+-import java.util.UUID;
+-
+-/**
+- * Ném ra khi chuyển trạng thái MatchProposal không hợp lệ.
+- * Map sang RFC 7807 Problem Detail: HTTP 409 Conflict, code INVALID_STATE_TRANSITION.
+- * (Cùng kiểu với SodViolationException của BE-6 – BE-1 bắt trong GlobalExceptionHandler.)
+- */
+-public class InvalidStateTransitionException extends RuntimeException {
+-
+-    private final String code = "INVALID_STATE_TRANSITION";
+-    private final int status = 409;
+-    private final String title = "Invalid State Transition";
+-    private final String type = "https://api.example.com/errors/invalid-state-transition";
+-
+-    private final UUID matchId;
+-    private final MatchStatus from;
+-    private final MatchStatus to;
+-
+-    public InvalidStateTransitionException(UUID matchId, MatchStatus from, MatchStatus to) {
+-        super("MatchProposal %s cannot transition from %s to %s (allowed: %s)"
+-                .formatted(matchId, from, to, from == null ? "[]" : from.allowedNext()));
+-        this.matchId = matchId;
+-        this.from = from;
+-        this.to = to;
+-    }
+-
+-    public String getCode() { return code; }
+-    public int getStatus() { return status; }
+-    public String getTitle() { return title; }
+-    public String getType() { return type; }
+-    public UUID getMatchId() { return matchId; }
+-    public MatchStatus getFrom() { return from; }
+-    public MatchStatus getTo() { return to; }
+-}
+diff --git a/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceInput.java b/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceInput.java
+index 381bc83..4a696ad 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceInput.java
++++ b/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceInput.java
+@@ -3,10 +3,18 @@ package com.tmw.backend.matching.scoring;
+ import java.math.BigDecimal;
+ import java.util.UUID;
+ 
++/**
++ * Dữ liệu chấm điểm tin cậy cho một cặp (dòng hóa đơn ↔ dòng PO ứng viên).
++ *
++ * @param invoicePoReference      số PO in trên hóa đơn (chuỗi, vd "PO-2026-0012"); null/blank nếu hóa đơn không ghi
++ * @param invoiceLinePoLineIdHint gợi ý dòng PO ở cấp dòng hóa đơn (nếu người nhập đã chỉ định), có thể null
++ * @param candidatePoNumber       purchase_order.po_number của PO ứng viên
++ * @param candidatePoLineId       id dòng PO ứng viên
++ */
+ public record ConfidenceInput(
+-        UUID invoicePoIdReference,
++        String invoicePoReference,
+         UUID invoiceLinePoLineIdHint,
+-        UUID candidatePoId,
++        String candidatePoNumber,
+         UUID candidatePoLineId,
+         UUID invoiceSupplierId,
+         UUID poSupplierId,
+@@ -17,4 +25,4 @@ public record ConfidenceInput(
+         BigDecimal qtyVariancePct,
+         BigDecimal qtyTolerancePct
+ ) {
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceScorer.java b/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceScorer.java
+index b815404..cb3b3af 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceScorer.java
++++ b/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceScorer.java
+@@ -63,23 +63,38 @@ public class ConfidenceScorer {
+         return clamp0To1(total.divide(BigDecimal.valueOf(lineScores.size()), SCORE_SCALE, RoundingMode.HALF_UP));
+     }
+ 
++    /**
++     * Tiêu chí số PO:
++     * - Dòng hóa đơn chỉ định đúng dòng PO ứng viên, hoặc số PO trên hóa đơn trùng po_number -> 1.0
++     * - Hóa đơn không ghi số PO và không chỉ định dòng PO (tự dò theo nhà cung cấp)           -> 0.5
++     * - Có ghi nhưng không khớp                                                               -> 0.0
++     * So sánh số PO sau khi bỏ khoảng trắng hai đầu và không phân biệt hoa/thường
++     * (PurchaseOrder lưu po_number dạng chữ hoa).
++     */
+     private BigDecimal scorePoReference(ConfidenceInput input) {
+-        // Khớp trực tiếp cả PO line hoặc header PO trên hóa đơn -> 1.0
+         if (input.invoiceLinePoLineIdHint() != null
+                 && input.invoiceLinePoLineIdHint().equals(input.candidatePoLineId())) {
+             return ONE;
+         }
+-        if (input.invoicePoIdReference() != null
+-                && input.invoicePoIdReference().equals(input.candidatePoId())) {
++        String invoiceRef = normalizePoNumber(input.invoicePoReference());
++        String candidatePoNumber = normalizePoNumber(input.candidatePoNumber());
++        if (invoiceRef != null && invoiceRef.equals(candidatePoNumber)) {
+             return ONE;
+         }
+-        // Hóa đơn không ghi sẵn số PO (tự dò theo nhà cung cấp) -> 0.5
+-        if (input.invoicePoIdReference() == null && input.invoiceLinePoLineIdHint() == null) {
++        if (invoiceRef == null && input.invoiceLinePoLineIdHint() == null) {
+             return HALF;
+         }
+         return ZERO;
+     }
+ 
++    private static String normalizePoNumber(String poNumber) {
++        if (poNumber == null) {
++            return null;
++        }
++        String trimmed = poNumber.trim();
++        return trimmed.isEmpty() ? null : trimmed.toUpperCase(Locale.ROOT);
++    }
++
+     private BigDecimal scoreSupplier(ConfidenceInput input) {
+         if (input.invoiceSupplierId() != null && input.invoiceSupplierId().equals(input.poSupplierId())) {
+             return ONE;
+diff --git a/backend/src/main/java/com/tmw/backend/matching/service/MatchStateMachine.java b/backend/src/main/java/com/tmw/backend/matching/service/MatchStateMachine.java
+index cce7c59..263d68b 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/service/MatchStateMachine.java
++++ b/backend/src/main/java/com/tmw/backend/matching/service/MatchStateMachine.java
+@@ -6,12 +6,31 @@ import com.tmw.backend.matching.api.MatchStatus;
+ import com.tmw.backend.matching.entity.Match;
+ import org.springframework.stereotype.Component;
+ 
++import java.time.Clock;
+ import java.util.Set;
+ import java.util.UUID;
+ 
++/**
++ * Ma trận chuyển trạng thái của Match (PROPOSED → APPROVED → POSTED; REJECTED/CANCELLED).
++ *
++ * <p>TODO(BE-5 ↔ BE-6): theo mục 1.5 bản phân công v2, state machine của Match thuộc BE-6.
++ * Lớp này tạm đặt ở matching/service cho đến khi hai bên chốt người giữ; khi chuyển thì
++ * chỉ cần dời file, entity Match không phụ thuộc ngược vào lớp này.</p>
++ */
+ @Component
+ public class MatchStateMachine {
+ 
++    private final Clock clock;
++
++    public MatchStateMachine() {
++        this(Clock.systemUTC());
++    }
++
++    /** Cho unit test cố định thời gian approved_at / posted_at. */
++    public MatchStateMachine(Clock clock) {
++        this.clock = clock;
++    }
++
+     public Match transition(Match match, MatchStatus targetStatus, UUID actorId, String reason) {
+         if (match == null) {
+             throw new BusinessException(ErrorCode.RESOURCE_NOT_FOUND, "Bản ghi đối chiếu (Match) không tồn tại");
+@@ -47,7 +66,7 @@ public class MatchStateMachine {
+ 
+         validateGuards(targetStatus, actorId, reason);
+ 
+-        match.applyTransition(targetStatus, actorId, reason);
++        match.applyTransition(targetStatus, actorId, reason, clock.instant());
+         return match;
+     }
+ 
+diff --git a/backend/src/main/java/com/tmw/backend/matching/strategy/MatchingContext.java b/backend/src/main/java/com/tmw/backend/matching/strategy/MatchingContext.java
+index d759cdb..5f7ca35 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/strategy/MatchingContext.java
++++ b/backend/src/main/java/com/tmw/backend/matching/strategy/MatchingContext.java
+@@ -11,7 +11,7 @@ import java.util.UUID;
+ public record MatchingContext(
+         UUID invoiceId,
+         UUID invoiceSupplierId,
+-        UUID invoicePoIdReference,
++        String invoicePoReference,
+         CurrencyCode currency,
+         MatchSource source,
+         ToleranceThreshold tolerance,
+@@ -30,6 +30,7 @@ public record MatchingContext(
+ 
+     public record PoLineCandidate(
+             UUID poId,
++            String poNumber,
+             UUID poLineId,
+             UUID supplierId,
+             String itemCode,
+diff --git a/backend/src/main/java/com/tmw/backend/matching/variance/VarianceCalculator.java b/backend/src/main/java/com/tmw/backend/matching/variance/VarianceCalculator.java
+index e493acf..a5d0645 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/variance/VarianceCalculator.java
++++ b/backend/src/main/java/com/tmw/backend/matching/variance/VarianceCalculator.java
+@@ -33,10 +33,13 @@ public class VarianceCalculator {
+ 
+         // 1. Chênh lệch số lượng (dương = hóa đơn nhiều hơn tham chiếu, âm = hóa đơn ít hơn tham chiếu)
+         BigDecimal qtyVariance = normMatchedQty.subtract(normRefQty).setScale(QTY_SCALE, ROUNDING);
+-        BigDecimal qtyVariancePct = qtyVariance.abs()
+-                .divide(normRefQty, INTERMEDIATE_SCALE, ROUNDING)
+-                .multiply(HUNDRED)
+-                .setScale(PCT_SCALE, ROUNDING);
++        // referenceQty = 0 (chưa có GRN / đã ghép hết) → tỷ lệ % không xác định, để null cho engine sinh MISSING_GRN
++        BigDecimal qtyVariancePct = normRefQty.signum() == 0
++                ? null
++                : qtyVariance.abs()
++                        .divide(normRefQty, INTERMEDIATE_SCALE, ROUNDING)
++                        .multiply(HUNDRED)
++                        .setScale(PCT_SCALE, ROUNDING);
+ 
+         // 2. Chênh lệch đơn giá
+         BigDecimal priceVariance = normInvPrice.subtract(normPoPrice).setScale(MONEY_SCALE, ROUNDING);
+@@ -70,12 +73,16 @@ public class VarianceCalculator {
+ 
+     /**
+      * Đánh giá kết quả chênh lệch có nằm trong ngưỡng cho phép của TolerancePolicy hay không.
++     * Thiếu số lượng tham chiếu (referenceQty = 0) luôn bị coi là ngoài dung sai.
+      */
+     public boolean isWithinTolerance(VarianceResult result, ToleranceThreshold threshold) {
+         if (result == null || threshold == null) {
+             throw new BusinessException(ErrorCode.VALIDATION_ERROR, "VarianceResult và ToleranceThreshold không được null");
+         }
+ 
++        if (result.qtyVariancePct() == null) {
++            return false;
++        }
+         boolean qtyOk = result.qtyVariancePct().compareTo(threshold.qtyTolerancePct()) <= 0;
+         boolean priceOk = result.priceVariancePct().compareTo(threshold.priceTolerancePct()) <= 0;
+         boolean amountOk = threshold.amountToleranceAbs() == null
+@@ -95,8 +102,9 @@ public class VarianceCalculator {
+         if (matchedQty == null || matchedQty.signum() <= 0) {
+             throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Số lượng hóa đơn đối chiếu (matchedQty) phải lớn hơn 0");
+         }
+-        if (referenceQty == null || referenceQty.signum() <= 0) {
+-            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Số lượng tham chiếu (referenceQty) phải lớn hơn 0");
++        // referenceQty = 0 là hợp lệ (chưa nhận hàng) – chỉ từ chối null hoặc số âm
++        if (referenceQty == null || referenceQty.signum() < 0) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Số lượng tham chiếu (referenceQty) không được null hoặc âm");
+         }
+         if (invoiceUnitPrice == null || invoiceUnitPrice.signum() < 0) {
+             throw new BusinessException(ErrorCode.VALIDATION_ERROR, "Đơn giá hóa đơn (invoiceUnitPrice) không được null hoặc âm");
+diff --git a/backend/src/main/java/com/tmw/backend/matching/variance/VarianceResult.java b/backend/src/main/java/com/tmw/backend/matching/variance/VarianceResult.java
+index 01400fb..7d4bcc1 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/variance/VarianceResult.java
++++ b/backend/src/main/java/com/tmw/backend/matching/variance/VarianceResult.java
+@@ -2,6 +2,12 @@ package com.tmw.backend.matching.variance;
+ 
+ import java.math.BigDecimal;
+ 
++/**
++ * Kết quả tính chênh lệch của một cặp ghép.
++ *
++ * @param qtyVariancePct null khi referenceQty = 0 (chưa nhận hàng / không còn số lượng tham chiếu):
++ *                       tỷ lệ % không xác định, xem {@link #missingReferenceQty()}
++ */
+ public record VarianceResult(
+         BigDecimal referenceQty,
+         BigDecimal qtyVariance,
+@@ -10,4 +16,13 @@ public record VarianceResult(
+         BigDecimal priceVariancePct,
+         BigDecimal amountVariance
+ ) {
+-}
+\ No newline at end of file
++
++    /**
++     * true khi không có số lượng tham chiếu (referenceQty = 0). Đây là tình huống nghiệp vụ bình thường,
++     * không phải lỗi đầu vào: engine phải tạo MatchException loại MISSING_GRN (3-way) cho dòng này
++     * rồi xử lý tiếp các dòng còn lại, thay vì làm hỏng cả lượt chạy.
++     */
++    public boolean missingReferenceQty() {
++        return referenceQty != null && referenceQty.signum() == 0;
++    }
++}
+diff --git a/backend/src/main/resources/db/migration/V1_0_5__create_match_tables.sql b/backend/src/main/resources/db/migration/V1_0_5__create_match_tables.sql
+deleted file mode 100644
+index 9417378..0000000
+--- a/backend/src/main/resources/db/migration/V1_0_5__create_match_tables.sql
++++ /dev/null
+@@ -1,109 +0,0 @@
+--- =============================================================================
+--- Migration V1_0_5: Create match_proposals & match_lines tables
+--- Role: BE-5 (Matching Engine) – Giai đoạn 1
+--- Cột id / version / created_at khớp với BaseEntity.
+--- FK sang bảng của BE-2/BE-3/BE-4 để dạng ALTER ở cuối – bật khi các nhánh đó đã merge.
+--- =============================================================================
+-
+-CREATE TABLE IF NOT EXISTS match_proposals (
+-    id                    UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+-    invoice_id            UUID           NOT NULL,
+-    supplier_id           UUID           NOT NULL,
+-    status                VARCHAR(16)    NOT NULL,
+-    source                VARCHAR(16)    NOT NULL,
+-    confidence            NUMERIC(5,4),
+-    total_matched_amount  NUMERIC(19,4)  NOT NULL DEFAULT 0,
+-
+-    proposed_by           UUID           NOT NULL,
+-    proposed_at           TIMESTAMPTZ    NOT NULL,
+-    approved_by           UUID,
+-    approved_at           TIMESTAMPTZ,
+-    posted_by             UUID,
+-    posted_at             TIMESTAMPTZ,
+-    rejected_by           UUID,
+-    rejected_at           TIMESTAMPTZ,
+-    cancelled_by          UUID,
+-    cancelled_at          TIMESTAMPTZ,
+-    reason                VARCHAR(1000),
+-
+-    version               INTEGER        NOT NULL DEFAULT 1,
+-    created_at            TIMESTAMPTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-
+-    CONSTRAINT ck_mp_status CHECK (status IN ('PROPOSED','APPROVED','POSTED','REJECTED','CANCELLED')),
+-    CONSTRAINT ck_mp_source CHECK (source IN ('AUTO','MANUAL')),
+-    CONSTRAINT ck_mp_confidence CHECK (
+-        (source = 'AUTO'   AND confidence IS NOT NULL AND confidence BETWEEN 0 AND 1) OR
+-        (source = 'MANUAL' AND confidence IS NULL)
+-    ),
+-    -- Ràng buộc nhất quán vòng đời ở tầng DB (phòng thủ thêm ngoài code)
+-    CONSTRAINT ck_mp_approved CHECK (status NOT IN ('APPROVED','POSTED') OR (approved_by IS NOT NULL AND approved_at IS NOT NULL)),
+-    CONSTRAINT ck_mp_posted   CHECK (status <> 'POSTED'    OR (posted_by IS NOT NULL AND posted_at IS NOT NULL)),
+-    CONSTRAINT ck_mp_rejected CHECK (status <> 'REJECTED'  OR (rejected_by IS NOT NULL AND reason IS NOT NULL)),
+-    CONSTRAINT ck_mp_cancel   CHECK (status <> 'CANCELLED' OR cancelled_by IS NOT NULL),
+-    -- SoD ở tầng DB: người duyệt/ghi sổ không trùng người trước
+-    CONSTRAINT ck_mp_sod_approve CHECK (approved_by IS NULL OR approved_by <> proposed_by),
+-    CONSTRAINT ck_mp_sod_post    CHECK (posted_by   IS NULL OR (posted_by <> proposed_by AND posted_by <> approved_by))
+-);
+-
+-CREATE INDEX IF NOT EXISTS ix_mp_invoice        ON match_proposals (invoice_id);
+-CREATE INDEX IF NOT EXISTS ix_mp_status_created ON match_proposals (status, proposed_at DESC, id);
+-CREATE INDEX IF NOT EXISTS ix_mp_supplier       ON match_proposals (supplier_id);
+-
+--- Mỗi hóa đơn chỉ có tối đa 1 đề xuất đang hiệu lực
+-CREATE UNIQUE INDEX IF NOT EXISTS ux_mp_invoice_active
+-    ON match_proposals (invoice_id)
+-    WHERE status IN ('PROPOSED','APPROVED');
+-
+-
+-CREATE TABLE IF NOT EXISTS match_lines (
+-    id                  UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+-    match_proposal_id   UUID           NOT NULL REFERENCES match_proposals(id) ON DELETE CASCADE,
+-    line_no             INT            NOT NULL,
+-
+-    invoice_line_id     UUID           NOT NULL,
+-    po_id               UUID           NOT NULL,
+-    po_line_id          UUID           NOT NULL,
+-    grn_line_id         UUID,
+-    match_type          VARCHAR(16)    NOT NULL,
+-
+-    matched_qty         NUMERIC(19,4)  NOT NULL,
+-    invoice_unit_price  NUMERIC(19,4)  NOT NULL,
+-    po_unit_price       NUMERIC(19,4)  NOT NULL,
+-    matched_amount      NUMERIC(19,4)  NOT NULL,
+-
+-    reference_qty       NUMERIC(19,4),
+-    qty_variance        NUMERIC(19,4),
+-    qty_variance_pct    NUMERIC(9,4),
+-    price_variance      NUMERIC(19,4),
+-    price_variance_pct  NUMERIC(9,4),
+-    amount_variance     NUMERIC(19,4),
+-    within_tolerance    BOOLEAN,
+-
+-    status              VARCHAR(16)    NOT NULL DEFAULT 'RESERVED',
+-    version             INTEGER        NOT NULL DEFAULT 1,
+-    created_at          TIMESTAMPTZ    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-
+-    CONSTRAINT uq_ml_line_no      UNIQUE (match_proposal_id, line_no),
+-    CONSTRAINT ck_ml_match_type   CHECK (match_type IN ('TWO_WAY','THREE_WAY')),
+-    CONSTRAINT ck_ml_grn_required CHECK (match_type = 'TWO_WAY' OR grn_line_id IS NOT NULL),
+-    CONSTRAINT ck_ml_qty_pos      CHECK (matched_qty > 0),
+-    CONSTRAINT ck_ml_price_nonneg CHECK (invoice_unit_price >= 0 AND po_unit_price >= 0),
+-    CONSTRAINT ck_ml_status       CHECK (status IN ('RESERVED','ALLOCATED','RELEASED'))
+-);
+-
+-CREATE INDEX IF NOT EXISTS ix_ml_proposal     ON match_lines (match_proposal_id);
+-CREATE INDEX IF NOT EXISTS ix_ml_invoice_line ON match_lines (invoice_line_id);
+-CREATE INDEX IF NOT EXISTS ix_ml_grn_line     ON match_lines (grn_line_id) WHERE grn_line_id IS NOT NULL;
+--- Phục vụ tính reserved/allocated theo dòng PO (BE-3)
+-CREATE INDEX IF NOT EXISTS ix_ml_po_line_status ON match_lines (po_line_id, status);
+-
+-
+--- ---------------------------------------------------------------------
+--- FK sang bảng chứng từ – bỏ comment khi nhánh BE-2/BE-3/BE-4 đã merge vào main
+--- ---------------------------------------------------------------------
+--- ALTER TABLE match_proposals ADD CONSTRAINT fk_mp_invoice  FOREIGN KEY (invoice_id)      REFERENCES invoices(id);
+--- ALTER TABLE match_proposals ADD CONSTRAINT fk_mp_supplier FOREIGN KEY (supplier_id)     REFERENCES supplier(id);
+--- ALTER TABLE match_lines     ADD CONSTRAINT fk_ml_inv_line FOREIGN KEY (invoice_line_id) REFERENCES invoice_lines(id);
+--- ALTER TABLE match_lines     ADD CONSTRAINT fk_ml_po       FOREIGN KEY (po_id)           REFERENCES purchase_orders(id);
+--- ALTER TABLE match_lines     ADD CONSTRAINT fk_ml_po_line  FOREIGN KEY (po_line_id)      REFERENCES purchase_order_lines(id);
+--- ALTER TABLE match_lines     ADD CONSTRAINT fk_ml_grn_line FOREIGN KEY (grn_line_id)     REFERENCES goods_receipt_lines(id);
+diff --git a/backend/src/main/resources/db/migration/V202611270140__matching_create_match_tables.sql b/backend/src/main/resources/db/migration/V202611270140__matching_create_match_tables.sql
+new file mode 100644
+index 0000000..a894ada
+--- /dev/null
++++ b/backend/src/main/resources/db/migration/V202611270140__matching_create_match_tables.sql
+@@ -0,0 +1,117 @@
++-- =============================================================================
++-- BE-5 · Matching · Tạo bảng match và match_line
++-- Khớp 1-1 với entity com.tmw.backend.matching.entity.Match / MatchLine
++-- (chạy được với spring.jpa.hibernate.ddl-auto=validate).
++--
++-- Thay thế file V1_0_5__create_match_tables.sql cũ (tên bảng/cột không khớp entity).
++--
++-- Chưa khai báo FK sang invoice / invoice_line / purchase_order / po_line /
++-- goods_receipt_line / tolerance_policy vì các bảng đó chưa có migration tạo bảng trên develop.
++-- Sẽ bổ sung bằng một migration riêng khi BE-2/BE-3/BE-4 đã có migration của họ.
++-- =============================================================================
++
++CREATE TABLE match (
++    id                      UUID          PRIMARY KEY,
++    invoice_id              UUID          NOT NULL,
++    status                  VARCHAR(30)   NOT NULL,
++    source                  VARCHAR(20)   NOT NULL,
++    allocation_state        VARCHAR(20)   NOT NULL,
++    overall_confidence      NUMERIC(5,4),
++    tolerance_policy_id     UUID,
++    has_variance_exception  BOOLEAN       NOT NULL DEFAULT FALSE,
++    summary_reason          VARCHAR(500),
++    proposed_by             UUID          NOT NULL,
++    approved_by             UUID,
++    approved_at             TIMESTAMPTZ,
++    posted_by               UUID,
++    posted_at               TIMESTAMPTZ,
++    reject_reason           VARCHAR(500),
++    version                 BIGINT        NOT NULL DEFAULT 0,
++    created_at              TIMESTAMPTZ   NOT NULL,
++    updated_at              TIMESTAMPTZ   NOT NULL,
++
++    CONSTRAINT chk_match_status
++        CHECK (status IN ('PROPOSED', 'APPROVED', 'POSTED', 'REJECTED', 'CANCELLED')),
++    CONSTRAINT chk_match_source
++        CHECK (source IN ('AUTO', 'MANUAL')),
++    CONSTRAINT chk_match_allocation_state
++        CHECK (allocation_state IN ('NONE', 'RESERVED', 'ALLOCATED', 'RELEASED')),
++    -- AUTO bắt buộc có điểm 0..1, MANUAL không có điểm
++    CONSTRAINT chk_match_confidence_by_source CHECK (
++        (source = 'AUTO'   AND overall_confidence IS NOT NULL AND overall_confidence BETWEEN 0 AND 1)
++     OR (source = 'MANUAL' AND overall_confidence IS NULL)
++    ),
++    -- Nhất quán vòng đời: đã duyệt/ghi sổ thì phải có người và thời điểm; reject/cancel phải có lý do
++    CONSTRAINT chk_match_approved_audit CHECK (
++        status NOT IN ('APPROVED', 'POSTED') OR (approved_by IS NOT NULL AND approved_at IS NOT NULL)
++    ),
++    CONSTRAINT chk_match_posted_audit CHECK (
++        status <> 'POSTED' OR (posted_by IS NOT NULL AND posted_at IS NOT NULL)
++    ),
++    CONSTRAINT chk_match_reject_reason CHECK (
++        status NOT IN ('REJECTED', 'CANCELLED') OR reject_reason IS NOT NULL
++    )
++);
++
++-- Mỗi hóa đơn chỉ có tối đa 1 Match đang hoạt động (PROPOSED/APPROVED).
++-- Match REJECTED/CANCELLED/POSTED không bị giới hạn → hóa đơn được đối chiếu lại sau khi bị từ chối/hủy.
++CREATE UNIQUE INDEX uk_match_active_invoice
++    ON match (invoice_id)
++    WHERE status IN ('PROPOSED', 'APPROVED');
++
++-- Lịch sử Match theo hóa đơn (findByInvoiceIdOrderByCreatedAtDesc)
++CREATE INDEX idx_match_invoice_created ON match (invoice_id, created_at DESC);
++-- GET /matches lọc theo status, phân trang cursor (created_at, id)
++CREATE INDEX idx_match_status_created ON match (status, created_at DESC, id);
++
++
++CREATE TABLE match_line (
++    id                   UUID           PRIMARY KEY,
++    match_id             UUID           NOT NULL,
++    line_no              INTEGER        NOT NULL,
++    invoice_line_id      UUID           NOT NULL,
++    po_id                UUID           NOT NULL,
++    po_line_id           UUID           NOT NULL,
++    grn_line_id          UUID,
++    match_type           VARCHAR(16)    NOT NULL,
++    matched_qty          NUMERIC(19,4)  NOT NULL,
++    invoice_unit_price   NUMERIC(19,4)  NOT NULL,
++    po_unit_price        NUMERIC(19,4)  NOT NULL,
++    matched_amount       NUMERIC(19,4)  NOT NULL,
++    reference_qty        NUMERIC(19,4),
++    qty_variance         NUMERIC(19,4),
++    qty_variance_pct     NUMERIC(19,4),
++    price_variance       NUMERIC(19,4),
++    price_variance_pct   NUMERIC(19,4),
++    amount_variance      NUMERIC(19,4),
++    within_tolerance     BOOLEAN,
++    confidence_score     NUMERIC(5,4),
++    allocation_state     VARCHAR(16)    NOT NULL,
++    created_at           TIMESTAMPTZ    NOT NULL,
++    updated_at           TIMESTAMPTZ    NOT NULL,
++
++    CONSTRAINT fk_match_line_match
++        FOREIGN KEY (match_id) REFERENCES match (id) ON DELETE CASCADE,
++    CONSTRAINT uk_match_line_match_inv_line_po_line
++        UNIQUE (match_id, invoice_line_id, po_line_id),
++    CONSTRAINT uk_match_line_match_line_no
++        UNIQUE (match_id, line_no),
++    CONSTRAINT chk_match_line_match_type
++        CHECK (match_type IN ('TWO_WAY', 'THREE_WAY')),
++    CONSTRAINT chk_match_line_grn_for_three_way
++        CHECK (match_type = 'TWO_WAY' OR grn_line_id IS NOT NULL),
++    CONSTRAINT chk_match_line_qty_positive
++        CHECK (matched_qty > 0),
++    CONSTRAINT chk_match_line_price_non_negative
++        CHECK (invoice_unit_price >= 0 AND po_unit_price >= 0),
++    CONSTRAINT chk_match_line_confidence_range
++        CHECK (confidence_score IS NULL OR confidence_score BETWEEN 0 AND 1),
++    CONSTRAINT chk_match_line_allocation_state
++        CHECK (allocation_state IN ('NONE', 'RESERVED', 'ALLOCATED', 'RELEASED'))
++);
++
++-- Tổng reserved/allocated theo dòng PO (MatchLineRepository.sumMatchedQty, đối soát với BE-3)
++CREATE INDEX idx_match_line_po_line_state ON match_line (po_line_id, allocation_state);
++-- Số lượng đã ghép theo dòng hóa đơn (sumActiveQtyByInvoiceLine)
++CREATE INDEX idx_match_line_invoice_line ON match_line (invoice_line_id);
++CREATE INDEX idx_match_line_grn_line ON match_line (grn_line_id) WHERE grn_line_id IS NOT NULL;
+diff --git a/backend/src/test/java/com/tmw/backend/matching/MatchPartialUniqueIndexIntegrationTest.java b/backend/src/test/java/com/tmw/backend/matching/MatchPartialUniqueIndexIntegrationTest.java
+index e69de29..f3709ea 100644
+--- a/backend/src/test/java/com/tmw/backend/matching/MatchPartialUniqueIndexIntegrationTest.java
++++ b/backend/src/test/java/com/tmw/backend/matching/MatchPartialUniqueIndexIntegrationTest.java
+@@ -0,0 +1,208 @@
++package com.tmw.backend.matching;
++
++import com.tmw.backend.testinfra.PostgresContainerBase;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.sql.Connection;
++import java.sql.DriverManager;
++import java.sql.PreparedStatement;
++import java.sql.SQLException;
++import java.sql.Statement;
++import java.sql.Timestamp;
++import java.time.Instant;
++import java.util.UUID;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatCode;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++/**
++ * Kiểm tra ràng buộc DB của module matching trên PostgreSQL thật (Testcontainers của PostgresContainerBase).
++ *
++ * <p>Chạy trực tiếp file migration của BE-5 trên một schema riêng cho mỗi test, nên không phụ thuộc
++ * vào việc Flyway đã được cấu hình cho toàn dự án hay migration của các module khác đã đầy đủ chưa.
++ * Khi Tech Lead bật Flyway + ddl-auto=validate, chính file migration này sẽ được Flyway chạy.</p>
++ */
++class MatchPartialUniqueIndexIntegrationTest extends PostgresContainerBase {
++
++    private static final String MIGRATION = "/db/migration/V202611270140__matching_create_match_tables.sql";
++    private static final String UNIQUE_VIOLATION = "23505";
++    private static final String CHECK_VIOLATION = "23514";
++
++    private Connection connection;
++    private String schema;
++
++    @BeforeEach
++    void createIsolatedSchemaAndRunMigration() throws Exception {
++        connection = DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
++        schema = "be5_it_" + UUID.randomUUID().toString().replace("-", "");
++        try (Statement st = connection.createStatement()) {
++            st.execute("CREATE SCHEMA " + schema);
++            st.execute("SET search_path TO " + schema);
++            st.execute(readMigration());
++        }
++    }
++
++    @AfterEach
++    void dropSchema() throws SQLException {
++        try (Statement st = connection.createStatement()) {
++            st.execute("DROP SCHEMA IF EXISTS " + schema + " CASCADE");
++        } finally {
++            connection.close();
++        }
++    }
++
++    // ------------------------------------------------------------------ uk_match_active_invoice
++
++    @Test
++    void shouldAllowOnlyOneActiveMatchPerInvoice() throws SQLException {
++        UUID invoiceId = UUID.randomUUID();
++        insertMatch(invoiceId, "PROPOSED");
++
++        assertSqlState(() -> insertMatch(invoiceId, "PROPOSED"), UNIQUE_VIOLATION);
++        assertSqlState(() -> insertMatch(invoiceId, "APPROVED"), UNIQUE_VIOLATION);
++    }
++
++    @Test
++    void shouldAllowNewActiveMatchAfterPreviousOneRejectedOrCancelled() throws SQLException {
++        UUID invoiceId = UUID.randomUUID();
++        UUID first = insertMatch(invoiceId, "PROPOSED");
++
++        updateStatus(first, "REJECTED", "Sai đơn giá dòng 2");
++        UUID second = insertMatch(invoiceId, "PROPOSED");
++
++        updateStatus(second, "CANCELLED", "Matcher hủy để ghép lại");
++        assertThatCode(() -> insertMatch(invoiceId, "PROPOSED")).doesNotThrowAnyException();
++    }
++
++    @Test
++    void shouldNotLimitTerminalMatchesOrOtherInvoices() {
++        UUID invoiceId = UUID.randomUUID();
++        assertThatCode(() -> {
++            insertMatch(invoiceId, "POSTED");
++            insertMatch(invoiceId, "REJECTED");
++            insertMatch(invoiceId, "CANCELLED");
++            insertMatch(invoiceId, "PROPOSED");
++            insertMatch(UUID.randomUUID(), "PROPOSED");
++        }).doesNotThrowAnyException();
++    }
++
++    // ------------------------------------------------------------------ check constraints
++
++    @Test
++    void shouldEnforceConfidenceBySource() {
++        assertSqlState(() -> insertMatch(UUID.randomUUID(), "PROPOSED", "MANUAL", "0.5000"), CHECK_VIOLATION);
++        assertSqlState(() -> insertMatch(UUID.randomUUID(), "PROPOSED", "AUTO", null), CHECK_VIOLATION);
++        assertThatCode(() -> insertMatch(UUID.randomUUID(), "PROPOSED", "MANUAL", null)).doesNotThrowAnyException();
++    }
++
++    @Test
++    void shouldRequireReasonWhenRejectedOrCancelled() throws SQLException {
++        UUID matchId = insertMatch(UUID.randomUUID(), "PROPOSED");
++        assertSqlState(() -> updateStatus(matchId, "REJECTED", null), CHECK_VIOLATION);
++        assertSqlState(() -> updateStatus(matchId, "CANCELLED", null), CHECK_VIOLATION);
++    }
++
++    @Test
++    void shouldEnforceMatchLineUniquenessAndPositiveQty() throws SQLException {
++        UUID matchId = insertMatch(UUID.randomUUID(), "PROPOSED");
++        UUID invoiceLineId = UUID.randomUUID();
++        UUID poLineId = UUID.randomUUID();
++
++        insertLine(matchId, 1, invoiceLineId, poLineId, "5");
++
++        assertSqlState(() -> insertLine(matchId, 2, invoiceLineId, poLineId, "3"), UNIQUE_VIOLATION);
++        assertSqlState(() -> insertLine(matchId, 1, UUID.randomUUID(), UUID.randomUUID(), "3"), UNIQUE_VIOLATION);
++        assertSqlState(() -> insertLine(matchId, 3, UUID.randomUUID(), UUID.randomUUID(), "0"), CHECK_VIOLATION);
++    }
++
++    // ------------------------------------------------------------------ helpers
++
++    private UUID insertMatch(UUID invoiceId, String status) throws SQLException {
++        return insertMatch(invoiceId, status, "AUTO", "0.9000");
++    }
++
++    private UUID insertMatch(UUID invoiceId, String status, String source, String confidence) throws SQLException {
++        UUID id = UUID.randomUUID();
++        boolean approved = status.equals("APPROVED") || status.equals("POSTED");
++        boolean posted = status.equals("POSTED");
++        boolean terminal = status.equals("REJECTED") || status.equals("CANCELLED");
++        Timestamp now = Timestamp.from(Instant.now());
++
++        String sql = """
++                INSERT INTO match (id, invoice_id, status, source, allocation_state, overall_confidence,
++                                   proposed_by, approved_by, approved_at, posted_by, posted_at, reject_reason,
++                                   created_at, updated_at)
++                VALUES (?, ?, ?, ?, 'NONE', ?::numeric, ?, ?, ?, ?, ?, ?, ?, ?)
++                """;
++        try (PreparedStatement ps = connection.prepareStatement(sql)) {
++            ps.setObject(1, id);
++            ps.setObject(2, invoiceId);
++            ps.setString(3, status);
++            ps.setString(4, source);
++            ps.setString(5, confidence);
++            ps.setObject(6, UUID.randomUUID());
++            ps.setObject(7, approved ? UUID.randomUUID() : null);
++            ps.setTimestamp(8, approved ? now : null);
++            ps.setObject(9, posted ? UUID.randomUUID() : null);
++            ps.setTimestamp(10, posted ? now : null);
++            ps.setString(11, terminal ? "Lý do kiểm thử" : null);
++            ps.setTimestamp(12, now);
++            ps.setTimestamp(13, now);
++            ps.executeUpdate();
++        }
++        return id;
++    }
++
++    private void updateStatus(UUID matchId, String status, String reason) throws SQLException {
++        try (PreparedStatement ps = connection.prepareStatement(
++                "UPDATE match SET status = ?, reject_reason = ? WHERE id = ?")) {
++            ps.setString(1, status);
++            ps.setString(2, reason);
++            ps.setObject(3, matchId);
++            ps.executeUpdate();
++        }
++    }
++
++    private void insertLine(UUID matchId, int lineNo, UUID invoiceLineId, UUID poLineId, String qty) throws SQLException {
++        String sql = """
++                INSERT INTO match_line (id, match_id, line_no, invoice_line_id, po_id, po_line_id, match_type,
++                                        matched_qty, invoice_unit_price, po_unit_price, matched_amount,
++                                        allocation_state, created_at, updated_at)
++                VALUES (?, ?, ?, ?, ?, ?, 'TWO_WAY', ?::numeric, 10, 10, 50, 'NONE', now(), now())
++                """;
++        try (PreparedStatement ps = connection.prepareStatement(sql)) {
++            ps.setObject(1, UUID.randomUUID());
++            ps.setObject(2, matchId);
++            ps.setInt(3, lineNo);
++            ps.setObject(4, invoiceLineId);
++            ps.setObject(5, UUID.randomUUID());
++            ps.setObject(6, poLineId);
++            ps.setString(7, qty);
++            ps.executeUpdate();
++        }
++    }
++
++    private static void assertSqlState(SqlAction action, String expectedState) {
++        assertThatThrownBy(action::run)
++                .isInstanceOfSatisfying(SQLException.class, ex ->
++                        assertThat(ex.getSQLState()).isEqualTo(expectedState));
++    }
++
++    private static String readMigration() throws IOException {
++        try (InputStream in = MatchPartialUniqueIndexIntegrationTest.class.getResourceAsStream(MIGRATION)) {
++            assertThat(in).as("Không tìm thấy migration %s trên classpath", MIGRATION).isNotNull();
++            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
++        }
++    }
++
++    @FunctionalInterface
++    private interface SqlAction {
++        void run() throws SQLException;
++    }
++}
+diff --git a/backend/src/test/java/com/tmw/backend/matching/entity/MatchDomainUnitTest.java b/backend/src/test/java/com/tmw/backend/matching/entity/MatchDomainUnitTest.java
+index 1ebdab5..a069041 100644
+--- a/backend/src/test/java/com/tmw/backend/matching/entity/MatchDomainUnitTest.java
++++ b/backend/src/test/java/com/tmw/backend/matching/entity/MatchDomainUnitTest.java
+@@ -1,6 +1,7 @@
+ package com.tmw.backend.matching.entity;
+ 
+ import java.math.BigDecimal;
++import java.time.Instant;
+ import java.util.UUID;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+@@ -55,6 +56,8 @@ class MatchDomainUnitTest {
+         assertThat(match.isHasVarianceException()).isTrue();
+         assertThat(match.getStatus()).isEqualTo(MatchStatus.PROPOSED);
+         assertThat(match.getAllocationState()).isEqualTo(AllocationState.NONE);
++        // Dòng mới chưa giữ chỗ: cùng trạng thái NONE với Match
++        assertThat(match.getLines()).allMatch(l -> l.getAllocationState() == AllocationState.NONE);
+ 
+         // Không được chốt ALLOCATED khi chưa RESERVED
+         assertThatThrownBy(match::markAllocated)
+@@ -63,8 +66,16 @@ class MatchDomainUnitTest {
+ 
+         // NONE -> RESERVED -> ALLOCATED và PROPOSED -> APPROVED
+         match.markReserved();
+-        match.applyTransition(MatchStatus.APPROVED, approverId, "Phát hiện lệch đơn giá 10% ở dòng 2");
++        assertThat(match.getLines()).allMatch(l -> l.getAllocationState() == AllocationState.RESERVED);
++
++        Instant approvedAt = Instant.parse("2026-11-27T02:00:00Z");
++        match.updateSummaryReason("Phát hiện lệch đơn giá 10% ở dòng 2");
++        match.applyTransition(MatchStatus.APPROVED, approverId, "Đồng ý lệch giá", approvedAt);
+         match.markAllocated();
++        assertThat(match.getLines()).allMatch(l -> l.getAllocationState() == AllocationState.ALLOCATED);
++        assertThat(match.getApprovedAt()).isEqualTo(approvedAt);
++        // Lý do duyệt không ghi đè tóm tắt của engine
++        assertThat(match.getSummaryReason()).isEqualTo("Phát hiện lệch đơn giá 10% ở dòng 2");
+ 
+         assertThat(match.getStatus()).isEqualTo(MatchStatus.APPROVED);
+         assertThat(match.getApprovedBy()).isEqualTo(approverId);
+@@ -75,6 +86,7 @@ class MatchDomainUnitTest {
+         assertThat(proposal.invoiceId()).isEqualTo(invoiceId);
+         assertThat(proposal.status()).isEqualTo(MatchStatus.APPROVED);
+         assertThat(proposal.approvedBy()).isEqualTo(approverId);
++        assertThat(proposal.approvedAt()).isEqualTo(approvedAt);
+         assertThat(proposal.allocationState()).isEqualTo(AllocationState.ALLOCATED);
+         assertThat(proposal.hasVarianceException()).isTrue();
+         assertThat(proposal.lines()).hasSize(2);
+@@ -82,7 +94,7 @@ class MatchDomainUnitTest {
+ 
+     @Test
+     void shouldRejectDuplicateInvoiceLineAndPoLinePairWithinSameMatch() {
+-        Match match = new Match(UUID.randomUUID(), MatchSource.MANUAL, null, new BigDecimal("0.8000"), UUID.randomUUID());
++        Match match = new Match(UUID.randomUUID(), MatchSource.MANUAL, null, null, UUID.randomUUID());
+         UUID sharedInvoiceLineId = UUID.randomUUID();
+         UUID sharedPoLineId = UUID.randomUUID();
+         UUID poId = UUID.randomUUID();
+@@ -128,6 +140,8 @@ class MatchDomainUnitTest {
+         rejectedMatch.markReleased();
+ 
+         assertThat(rejectedMatch.getStatus()).isEqualTo(MatchStatus.REJECTED);
++        assertThat(rejectedMatch.getRejectReason()).isEqualTo("Từ chối đề xuất");
++        assertThat(rejectedMatch.getSummaryReason()).isNull();
+         assertThat(rejectedMatch.getAllocationState()).isEqualTo(AllocationState.RELEASED);
+ 
+         // Luồng POSTED bất biến không cho phép chỉnh sửa hay đổi trạng thái
+@@ -144,4 +158,52 @@ class MatchDomainUnitTest {
+                 .isInstanceOfSatisfying(BusinessException.class, ex ->
+                         assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.INVALID_STATE_TRANSITION));
+     }
+-}
+\ No newline at end of file
++
++    @Test
++    void shouldKeepConfidenceNullForManualAndRequireItForAuto() {
++        Match manual = new Match(UUID.randomUUID(), MatchSource.MANUAL, null, null, UUID.randomUUID());
++        assertThat(manual.getOverallConfidence()).isNull();
++        assertThat(manual.toProposal().overallConfidence()).isNull();
++
++        assertThatThrownBy(() -> new Match(UUID.randomUUID(), MatchSource.MANUAL, null, new BigDecimal("0.8000"), UUID.randomUUID()))
++                .isInstanceOfSatisfying(BusinessException.class, ex ->
++                        assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
++        assertThatThrownBy(() -> new Match(UUID.randomUUID(), MatchSource.AUTO, null, null, UUID.randomUUID()))
++                .isInstanceOfSatisfying(BusinessException.class, ex ->
++                        assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
++        assertThatThrownBy(() -> new Match(UUID.randomUUID(), MatchSource.AUTO, null, new BigDecimal("1.0001"), UUID.randomUUID()))
++                .isInstanceOfSatisfying(BusinessException.class, ex ->
++                        assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
++    }
++
++    @Test
++    void shouldKeepMatchAndLineAllocationStateInSyncAndBlockAddingLinesAfterReservation() {
++        Match match = new Match(UUID.randomUUID(), MatchSource.AUTO, null, new BigDecimal("0.9000"), UUID.randomUUID());
++        match.addLine(new MatchLine(
++                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), null,
++                MatchType.TWO_WAY, BigDecimal.ONE, BigDecimal.TEN, BigDecimal.TEN
++        ));
++        match.markReserved();
++
++        assertThatThrownBy(() -> match.addLine(new MatchLine(
++                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), null,
++                MatchType.TWO_WAY, BigDecimal.ONE, BigDecimal.TEN, BigDecimal.TEN
++        ))).isInstanceOfSatisfying(BusinessException.class, ex ->
++                assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.INVALID_STATE_TRANSITION));
++
++        match.applyTransition(MatchStatus.CANCELLED, UUID.randomUUID(), "Hủy để ghép lại");
++        match.markReleased();
++        assertThat(match.getAllocationState()).isEqualTo(AllocationState.RELEASED);
++        assertThat(match.getLines()).allMatch(l -> l.getAllocationState() == AllocationState.RELEASED);
++        assertThat(match.getRejectReason()).isEqualTo("Hủy để ghép lại");
++    }
++
++    @Test
++    void shouldRequireReasonForRejectAndCancel() {
++        Match match = new Match(UUID.randomUUID(), MatchSource.AUTO, null, BigDecimal.ONE, UUID.randomUUID());
++        assertThatThrownBy(() -> match.applyTransition(MatchStatus.REJECTED, UUID.randomUUID(), "  "))
++                .isInstanceOfSatisfying(BusinessException.class, ex ->
++                        assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
++        assertThat(match.getStatus()).isEqualTo(MatchStatus.PROPOSED);
++    }
++}
+diff --git a/backend/src/test/java/com/tmw/backend/matching/scoring/ConfidenceScorerUnitTest.java b/backend/src/test/java/com/tmw/backend/matching/scoring/ConfidenceScorerUnitTest.java
+index 180ec32..026f1eb 100644
+--- a/backend/src/test/java/com/tmw/backend/matching/scoring/ConfidenceScorerUnitTest.java
++++ b/backend/src/test/java/com/tmw/backend/matching/scoring/ConfidenceScorerUnitTest.java
+@@ -44,12 +44,11 @@ class ConfidenceScorerUnitTest {
+ 
+     @Test
+     void shouldScore1WhenAll5CriteriaMatchPerfectly() {
+-        UUID poId = UUID.randomUUID();
+         UUID poLineId = UUID.randomUUID();
+         UUID supplierId = UUID.randomUUID();
+ 
+         ConfidenceInput perfectInput = new ConfidenceInput(
+-                poId, poLineId, poId, poLineId,
++                "PO-2026-0012", poLineId, "PO-2026-0012", poLineId,
+                 supplierId, supplierId,
+                 " item-dell-5540 ", "ITEM-DELL-5540",
+                 BigDecimal.ZERO, new BigDecimal("1.0000"),
+@@ -81,7 +80,7 @@ class ConfidenceScorerUnitTest {
+ 
+         UUID supplierId = UUID.randomUUID();
+         ConfidenceInput partialInput = new ConfidenceInput(
+-                null, null, UUID.randomUUID(), UUID.randomUUID(), // Không có PO ref -> 0.5000
++                null, null, "PO-2026-0099", UUID.randomUUID(),   // Không có PO ref -> 0.5000
+                 supplierId, supplierId,                           // Khớp supplier -> 1.0000
+                 "ITEM-001-HCM", "ITEM-001",                       // Khớp một phần mã hàng -> 0.5000
+                 new BigDecimal("1.0000"), new BigDecimal("1.0000"), // Chạm biên ngưỡng giá -> 0.7000
+@@ -104,7 +103,7 @@ class ConfidenceScorerUnitTest {
+     void shouldPenalizeVarianceOutsideToleranceBelow07000() {
+         UUID supplierId = UUID.randomUUID();
+         ConfidenceInput outOfToleranceInput = new ConfidenceInput(
+-                null, null, UUID.randomUUID(), UUID.randomUUID(),
++                null, null, "PO-2026-0099", UUID.randomUUID(),
+                 supplierId, supplierId,
+                 "ITEM-A", "ITEM-A",
+                 new BigDecimal("50.5000"), new BigDecimal("1.0000"), // Lệch 50.5% trên ngưỡng 1% -> 0.3500
+@@ -116,4 +115,31 @@ class ConfidenceScorerUnitTest {
+         assertThat(breakdown.priceScore()).isEqualByComparingTo("0.3500");
+         assertThat(breakdown.quantityScore()).isEqualByComparingTo("0.0000");
+     }
+-}
+\ No newline at end of file
++
++    @Test
++    void shouldMatchPoReferenceAsStringIgnoringCaseAndSurroundingSpaces() {
++        assertThat(poReferenceScore(" po-2026-0012 ", "PO-2026-0012")).isEqualByComparingTo("1.0000");
++        assertThat(poReferenceScore("PO-2026-0012", "PO-2026-0013")).isEqualByComparingTo("0.0000");
++        // Hóa đơn không ghi số PO (null hoặc chỉ có khoảng trắng) -> 0.5000
++        assertThat(poReferenceScore(null, "PO-2026-0012")).isEqualByComparingTo("0.5000");
++        assertThat(poReferenceScore("   ", "PO-2026-0012")).isEqualByComparingTo("0.5000");
++    }
++
++    @Test
++    void shouldScore1WhenInvoiceLinePointsToCandidatePoLineEvenIfHeaderRefMissing() {
++        UUID poLineId = UUID.randomUUID();
++        ConfidenceInput input = new ConfidenceInput(
++                null, poLineId, "PO-2026-0012", poLineId,
++                null, null, null, null, null, null, null, null
++        );
++        assertThat(scorer.score(input).poReferenceScore()).isEqualByComparingTo("1.0000");
++    }
++
++    private BigDecimal poReferenceScore(String invoiceRef, String candidatePoNumber) {
++        ConfidenceInput input = new ConfidenceInput(
++                invoiceRef, null, candidatePoNumber, UUID.randomUUID(),
++                null, null, null, null, null, null, null, null
++        );
++        return scorer.score(input).poReferenceScore();
++    }
++}
+diff --git a/backend/src/test/java/com/tmw/backend/matching/service/MatchStateMachineMatrixUnitTest.java b/backend/src/test/java/com/tmw/backend/matching/service/MatchStateMachineMatrixUnitTest.java
+index 09d313b..45c7089 100644
+--- a/backend/src/test/java/com/tmw/backend/matching/service/MatchStateMachineMatrixUnitTest.java
++++ b/backend/src/test/java/com/tmw/backend/matching/service/MatchStateMachineMatrixUnitTest.java
+@@ -14,6 +14,9 @@ import org.junit.jupiter.params.provider.Arguments;
+ import org.junit.jupiter.params.provider.MethodSource;
+ 
+ import java.math.BigDecimal;
++import java.time.Clock;
++import java.time.Instant;
++import java.time.ZoneOffset;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+@@ -108,4 +111,17 @@ class MatchStateMachineMatrixUnitTest {
+             case CANCELLED -> stateMachine.cancel(match, UUID.randomUUID(), "Hủy lượt đối chiếu");
+         };
+     }
+-}
+\ No newline at end of file
++
++    @Test
++    void shouldStampApprovedAtAndPostedAtFromClock() {
++        Instant fixed = Instant.parse("2026-11-27T03:15:00Z");
++        MatchStateMachine fixedClockMachine = new MatchStateMachine(Clock.fixed(fixed, ZoneOffset.UTC));
++        Match match = new Match(UUID.randomUUID(), MatchSource.AUTO, null, new BigDecimal("0.9500"), UUID.randomUUID());
++
++        fixedClockMachine.approve(match, UUID.randomUUID(), null);
++        fixedClockMachine.post(match, UUID.randomUUID());
++
++        assertThat(match.getApprovedAt()).isEqualTo(fixed);
++        assertThat(match.getPostedAt()).isEqualTo(fixed);
++    }
++}
+diff --git a/backend/src/test/java/com/tmw/backend/matching/variance/VarianceCalculatorUnitTest.java b/backend/src/test/java/com/tmw/backend/matching/variance/VarianceCalculatorUnitTest.java
+index 469cc70..2d9b9ba 100644
+--- a/backend/src/test/java/com/tmw/backend/matching/variance/VarianceCalculatorUnitTest.java
++++ b/backend/src/test/java/com/tmw/backend/matching/variance/VarianceCalculatorUnitTest.java
+@@ -159,7 +159,8 @@ class VarianceCalculatorUnitTest {
+                 Arguments.of("Giá PO âm", "10", "10", "1000", "-0.01", CurrencyCode.VND, CurrencyCode.VND),
+                 Arguments.of("Số lượng hóa đơn bằng 0", "0", "10", "1000", "1000", CurrencyCode.VND, CurrencyCode.VND),
+                 Arguments.of("Số lượng hóa đơn âm", "-5", "10", "1000", "1000", CurrencyCode.VND, CurrencyCode.VND),
+-                Arguments.of("Số lượng tham chiếu bằng 0", "10", "0", "1000", "1000", CurrencyCode.VND, CurrencyCode.VND),
++                Arguments.of("Số lượng tham chiếu âm", "10", "-1", "1000", "1000", CurrencyCode.VND, CurrencyCode.VND),
++                Arguments.of("Thiếu số lượng tham chiếu (null)", "10", null, "1000", "1000", CurrencyCode.VND, CurrencyCode.VND),
+                 Arguments.of("Thiếu giá hóa đơn (null)", "10", "10", null, "1000", CurrencyCode.VND, CurrencyCode.VND),
+                 Arguments.of("Lệch loại tiền tệ VND vs USD", "10", "10", "1000", "1000", CurrencyCode.VND, CurrencyCode.USD)
+         );
+@@ -186,4 +187,33 @@ class VarianceCalculatorUnitTest {
+         )).isInstanceOfSatisfying(BusinessException.class, ex ->
+                 assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
+     }
+-}
+\ No newline at end of file
++
++    @Test
++    void shouldNotFailWhenReferenceQtyIsZeroAndFlagMissingReference() {
++        // Chưa có GRN (3-way) -> referenceQty = 0: không ném lỗi, để engine sinh MISSING_GRN cho dòng này
++        VarianceResult result = calculator.calculate(
++                new BigDecimal("10"), BigDecimal.ZERO,
++                new BigDecimal("1000"), new BigDecimal("1000"),
++                CurrencyCode.VND, CurrencyCode.VND
++        );
++
++        assertThat(result.missingReferenceQty()).isTrue();
++        assertThat(result.qtyVariance()).isEqualByComparingTo("10.0000");
++        assertThat(result.qtyVariancePct()).isNull();
++        assertThat(result.amountVariance()).isEqualByComparingTo("10000.0000");
++
++        ToleranceThreshold generous = new ToleranceThreshold(
++                new BigDecimal("100"), new BigDecimal("100"), null, true);
++        assertThat(calculator.isWithinTolerance(result, generous)).isFalse();
++    }
++
++    @Test
++    void shouldNotFlagMissingReferenceForNormalLines() {
++        VarianceResult result = calculator.calculate(
++                new BigDecimal("10"), new BigDecimal("10"),
++                new BigDecimal("1000"), new BigDecimal("1000"),
++                CurrencyCode.VND, CurrencyCode.VND
++        );
++        assertThat(result.missingReferenceQty()).isFalse();
++    }
++}
+-- 
+2.43.0
+

@@ -1,0 +1,1899 @@
+From e3e6f47958d814a0b8a51e30095e17499b317716 Mon Sep 17 00:00:00 2001
+From: BE-5 <be5@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 19:40:26 +0000
+Subject: [PATCH] =?UTF-8?q?feat(matching):=20giai=20=C4=91o=E1=BA=A1n=202?=
+ =?UTF-8?q?=20BE-5=20-=20CandidateFinder,=20ConfidenceScorer=20v1,=20thi?=
+ =?UTF-8?q?=E1=BA=BFt=20k=E1=BA=BF=20ph=C3=A2n=20b=E1=BB=95,=20=C4=91o=20h?=
+ =?UTF-8?q?i=E1=BB=87u=20n=C4=83ng?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- CandidateFinder: một truy vấn cho cả hóa đơn, xếp hạng dòng PO ứng viên cho từng dòng hóa đơn
+  (điểm giảm dần, cùng điểm thì PO cũ trước); trả số dư vế PO, vế GRN, availableQty và cờ missingGrn.
+- Đề xuất PurchaseOrderQueryApi (chủ sở hữu BE-3, mục 1.3) + JdbcPurchaseOrderQueryService (SQL thuần
+  ở sql/purchaseorder/find-candidate-po-lines.sql). Cần BE-3 review.
+- Index hỗ trợ bằng repeatable migration R__matching_candidate_finder_indexes.sql.
+- ConfidenceScorer v1: thêm gợi ý PO theo purchase_order_id; ConfidenceInput có builder; test null-safety
+  và điểm luôn trong [0,1].
+- docs/be5: thiết kế phân bổ một-nhiều/nhiều-một (1 trang) và kết quả đo
+  (1.000 PO: p95 0,51 ms; 20.000 PO: p95 5,68 ms → 0,99 ms nhờ index).
+- Test: CandidateFinderUnitTest, PoLineCandidateQueryUnitTest, CandidateFinderPerformanceIntegrationTest
+  (Testcontainers, 1.000 PO).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FuiRsK6QKFR8zMZDjCFKWD
+---
+ .../matching/candidate/CandidateFinder.java   | 189 +++++++++++++
+ .../candidate/CandidateFinderProperties.java  |  45 +++
+ .../candidate/CandidateSearchRequest.java     |  81 ++++++
+ .../candidate/CandidateSearchResult.java      |  81 ++++++
+ .../matching/scoring/ConfidenceInput.java     |  63 ++++-
+ .../matching/scoring/ConfidenceScorer.java    |  12 +-
+ .../matching/strategy/MatchingContext.java    |   1 +
+ .../api/PoLineCandidateQuery.java             |  82 ++++++
+ .../api/PoLineCandidateView.java              |  39 +++
+ .../api/PurchaseOrderQueryApi.java            |  23 ++
+ .../JdbcPurchaseOrderQueryService.java        |  91 ++++++
+ .../R__matching_candidate_finder_indexes.sql  |  22 ++
+ .../purchaseorder/find-candidate-po-lines.sql |  33 +++
+ ...idateFinderPerformanceIntegrationTest.java | 205 ++++++++++++++
+ .../candidate/CandidateFinderUnitTest.java    | 259 ++++++++++++++++++
+ .../scoring/ConfidenceScorerUnitTest.java     | 143 ++++++----
+ .../PoLineCandidateQueryUnitTest.java         |  54 ++++
+ .../matching/candidate-finder-schema.sql      |  44 +++
+ .../candidate-finder-seed-1000-po.sql         |  45 +++
+ docs/be5/candidate-finder-performance.md      |  50 ++++
+ .../thiet-ke-phan-bo-mot-nhieu-nhieu-mot.md   |  38 +++
+ 21 files changed, 1545 insertions(+), 55 deletions(-)
+ create mode 100644 backend/src/main/java/com/tmw/backend/matching/candidate/CandidateFinder.java
+ create mode 100644 backend/src/main/java/com/tmw/backend/matching/candidate/CandidateFinderProperties.java
+ create mode 100644 backend/src/main/java/com/tmw/backend/matching/candidate/CandidateSearchRequest.java
+ create mode 100644 backend/src/main/java/com/tmw/backend/matching/candidate/CandidateSearchResult.java
+ create mode 100644 backend/src/main/java/com/tmw/backend/purchaseorder/api/PoLineCandidateQuery.java
+ create mode 100644 backend/src/main/java/com/tmw/backend/purchaseorder/api/PoLineCandidateView.java
+ create mode 100644 backend/src/main/java/com/tmw/backend/purchaseorder/api/PurchaseOrderQueryApi.java
+ create mode 100644 backend/src/main/java/com/tmw/backend/purchaseorder/service/JdbcPurchaseOrderQueryService.java
+ create mode 100644 backend/src/main/resources/db/migration/R__matching_candidate_finder_indexes.sql
+ create mode 100644 backend/src/main/resources/sql/purchaseorder/find-candidate-po-lines.sql
+ create mode 100644 backend/src/test/java/com/tmw/backend/matching/candidate/CandidateFinderPerformanceIntegrationTest.java
+ create mode 100644 backend/src/test/java/com/tmw/backend/matching/candidate/CandidateFinderUnitTest.java
+ create mode 100644 backend/src/test/java/com/tmw/backend/purchaseorder/PoLineCandidateQueryUnitTest.java
+ create mode 100644 backend/src/test/resources/matching/candidate-finder-schema.sql
+ create mode 100644 backend/src/test/resources/matching/candidate-finder-seed-1000-po.sql
+ create mode 100644 docs/be5/candidate-finder-performance.md
+ create mode 100644 docs/be5/thiet-ke-phan-bo-mot-nhieu-nhieu-mot.md
+
+diff --git a/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateFinder.java b/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateFinder.java
+new file mode 100644
+index 0000000..52f1f3c
+--- /dev/null
++++ b/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateFinder.java
+@@ -0,0 +1,189 @@
++package com.tmw.backend.matching.candidate;
++
++import com.tmw.backend.matching.candidate.CandidateSearchRequest.InvoiceLineToMatch;
++import com.tmw.backend.matching.candidate.CandidateSearchResult.LineCandidates;
++import com.tmw.backend.matching.candidate.CandidateSearchResult.RankedCandidate;
++import com.tmw.backend.matching.scoring.ConfidenceBreakdown;
++import com.tmw.backend.matching.scoring.ConfidenceInput;
++import com.tmw.backend.matching.scoring.ConfidenceScorer;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateQuery;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateView;
++import com.tmw.backend.purchaseorder.api.PurchaseOrderQueryApi;
++import lombok.RequiredArgsConstructor;
++import org.springframework.stereotype.Component;
++
++import java.math.BigDecimal;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.UUID;
++
++import static com.tmw.backend.common.decimal.DecimalScales.INTERMEDIATE_SCALE;
++import static com.tmw.backend.common.decimal.DecimalScales.PCT_SCALE;
++import static com.tmw.backend.common.decimal.DecimalScales.QTY_SCALE;
++import static com.tmw.backend.common.decimal.DecimalScales.ROUNDING;
++
++/**
++ * Tìm và xếp hạng dòng PO ứng viên cho từng dòng hóa đơn (giai đoạn 2, BE-5).
++ *
++ * <p>Luồng: một truy vấn duy nhất qua PurchaseOrderQueryApi cho cả hóa đơn (nhà cung cấp, PO mở, ngày đặt
++ * &lt;= ngày hóa đơn, cùng tiền tệ, còn hạn mức PO, trùng mã hàng hoặc gợi ý PO) → với mỗi dòng hóa đơn,
++ * giữ các dòng PO liên quan (mã hàng khớp đủ/một phần, hoặc được chỉ định) → chấm điểm bằng ConfidenceScorer
++ * → sắp xếp: điểm giảm dần, rồi PO cũ trước (FIFO), số PO, số dòng.</p>
++ *
++ * <p>Chỉ đọc, không khóa, không giữ chỗ. Số dư trong kết quả có thể đã cũ khi giữ chỗ thật;
++ * CapacityAllocationService mới là nơi quyết định cuối cùng.</p>
++ */
++@Component
++@RequiredArgsConstructor
++public class CandidateFinder {
++
++    private static final BigDecimal HUNDRED = new BigDecimal("100");
++
++    private final PurchaseOrderQueryApi purchaseOrderQueryApi;
++    private final ConfidenceScorer confidenceScorer;
++    private final CandidateFinderProperties properties;
++
++    public CandidateSearchResult find(CandidateSearchRequest request) {
++        if (request.lines().isEmpty()) {
++            return CandidateSearchResult.empty(request.invoiceId());
++        }
++
++        List<PoLineCandidateView> poLines = purchaseOrderQueryApi.findCandidateLines(toQuery(request));
++
++        List<LineCandidates> result = new ArrayList<>(request.lines().size());
++        for (InvoiceLineToMatch line : request.lines()) {
++            result.add(new LineCandidates(line.invoiceLineId(), line.lineNo(), rankForLine(request, line, poLines)));
++        }
++        return new CandidateSearchResult(request.invoiceId(), result, poLines.size());
++    }
++
++    // ------------------------------------------------------------------ query
++
++    private PoLineCandidateQuery toQuery(CandidateSearchRequest request) {
++        Set<String> itemCodes = new LinkedHashSet<>();
++        Set<UUID> poLineHints = new LinkedHashSet<>();
++        for (InvoiceLineToMatch line : request.lines()) {
++            if (line.itemCode() != null) {
++                itemCodes.add(line.itemCode());
++            }
++            if (line.poLineIdHint() != null) {
++                poLineHints.add(line.poLineIdHint());
++            }
++        }
++        return new PoLineCandidateQuery(
++                request.supplierId(),
++                request.issueDate(),
++                request.currency(),
++                itemCodes,
++                poLineHints,
++                request.poReference(),
++                request.purchaseOrderIdHint(),
++                properties.getMaxScannedPoLines()
++        );
++    }
++
++    // ------------------------------------------------------------------ ranking
++
++    private List<RankedCandidate> rankForLine(
++            CandidateSearchRequest request,
++            InvoiceLineToMatch line,
++            List<PoLineCandidateView> poLines
++    ) {
++        List<Scored> scored = new ArrayList<>();
++        for (PoLineCandidateView po : poLines) {
++            BigDecimal available = availableQty(po, request.requireGrn());
++            ConfidenceBreakdown breakdown = confidenceScorer.score(ConfidenceInput.builder()
++                    .invoicePoReference(request.poReference())
++                    .invoicePoIdHint(request.purchaseOrderIdHint())
++                    .invoiceLinePoLineIdHint(line.poLineIdHint())
++                    .candidatePoNumber(po.poNumber())
++                    .candidatePoId(po.purchaseOrderId())
++                    .candidatePoLineId(po.poLineId())
++                    .invoiceSupplierId(request.supplierId())
++                    .poSupplierId(po.supplierId())
++                    .invoiceItemCode(line.itemCode())
++                    .poItemCode(po.itemCode())
++                    .priceVariancePct(priceVariancePct(line.unitPrice(), po.unitPrice()))
++                    .priceTolerancePct(request.priceTolerancePct())
++                    .qtyVariancePct(shortagePct(line.unmatchedQty(), available))
++                    .qtyTolerancePct(request.qtyTolerancePct())
++                    .build());
++
++            boolean hinted = po.poLineId().equals(line.poLineIdHint());
++            if (breakdown.itemCodeScore().signum() == 0 && !hinted) {
++                continue; // dòng PO của PO được gợi ý nhưng khác mặt hàng → không liên quan dòng này
++            }
++            if (breakdown.overallScore().compareTo(properties.getMinScore()) < 0) {
++                continue;
++            }
++            scored.add(new Scored(po, breakdown, available, request.requireGrn()));
++        }
++
++        scored.sort(Comparator
++                .comparing((Scored s) -> s.breakdown().overallScore()).reversed()
++                .thenComparing(s -> s.po().orderDate())
++                .thenComparing(s -> s.po().poNumber())
++                .thenComparingInt(s -> s.po().lineNo()));
++
++        List<RankedCandidate> ranked = new ArrayList<>();
++        int limit = Math.min(scored.size(), properties.getMaxPerLine());
++        for (int i = 0; i < limit; i++) {
++            ranked.add(scored.get(i).toRanked(i + 1));
++        }
++        return ranked;
++    }
++
++    /** Số lượng có thể ghép theo các vế hạn mức (mục 1.2): vế PO, và vế GRN khi require_grn. */
++    static BigDecimal availableQty(PoLineCandidateView po, boolean requireGrn) {
++        BigDecimal poRemaining = po.remainingQty();
++        BigDecimal available = requireGrn ? poRemaining.min(po.grnRemainingQty()) : poRemaining;
++        return (available.signum() < 0 ? BigDecimal.ZERO : available).setScale(QTY_SCALE, ROUNDING);
++    }
++
++    /** Phần trăm số lượng hóa đơn mà ứng viên KHÔNG đáp ứng được: 0% = đủ, 100% = không còn gì. */
++    static BigDecimal shortagePct(BigDecimal invoiceQty, BigDecimal availableQty) {
++        BigDecimal covered = invoiceQty.min(availableQty.max(BigDecimal.ZERO));
++        return invoiceQty.subtract(covered)
++                .multiply(HUNDRED)
++                .divide(invoiceQty, INTERMEDIATE_SCALE, ROUNDING)
++                .setScale(PCT_SCALE, ROUNDING);
++    }
++
++    /** Cùng quy ước với VarianceCalculator: |giá HĐ − giá PO| / giá PO × 100; giá PO = 0 thì 0% hoặc 100%. */
++    static BigDecimal priceVariancePct(BigDecimal invoicePrice, BigDecimal poPrice) {
++        if (poPrice == null || invoicePrice == null) {
++            return null;
++        }
++        if (poPrice.signum() == 0) {
++            return (invoicePrice.signum() == 0 ? BigDecimal.ZERO : HUNDRED).setScale(PCT_SCALE, ROUNDING);
++        }
++        return invoicePrice.subtract(poPrice).abs()
++                .multiply(HUNDRED)
++                .divide(poPrice, INTERMEDIATE_SCALE, ROUNDING)
++                .setScale(PCT_SCALE, ROUNDING);
++    }
++
++    private record Scored(PoLineCandidateView po, ConfidenceBreakdown breakdown, BigDecimal available, boolean requireGrn) {
++        RankedCandidate toRanked(int rank) {
++            BigDecimal grnRemaining = po.grnRemainingQty().setScale(QTY_SCALE, ROUNDING);
++            return new RankedCandidate(
++                    rank,
++                    po.purchaseOrderId(),
++                    po.poNumber(),
++                    po.orderDate(),
++                    po.poLineId(),
++                    po.lineNo(),
++                    po.itemCode(),
++                    po.unitPrice(),
++                    po.remainingQty().setScale(QTY_SCALE, ROUNDING),
++                    grnRemaining,
++                    available,
++                    requireGrn && grnRemaining.signum() == 0,
++                    breakdown
++            );
++        }
++    }
++}
+diff --git a/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateFinderProperties.java b/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateFinderProperties.java
+new file mode 100644
+index 0000000..669ed57
+--- /dev/null
++++ b/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateFinderProperties.java
+@@ -0,0 +1,45 @@
++package com.tmw.backend.matching.candidate;
++
++import com.tmw.backend.common.error.BusinessException;
++import com.tmw.backend.common.error.ErrorCode;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateQuery;
++import jakarta.annotation.PostConstruct;
++import lombok.Getter;
++import lombok.Setter;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.stereotype.Component;
++
++import java.math.BigDecimal;
++
++/**
++ * Cấu hình CandidateFinder (tmw.matching.candidate.*).
++ */
++@Getter
++@Setter
++@Component
++@ConfigurationProperties(prefix = "tmw.matching.candidate")
++public class CandidateFinderProperties {
++
++    /** Số ứng viên tối đa giữ lại cho mỗi dòng hóa đơn. */
++    private int maxPerLine = 5;
++
++    /** Trần số dòng PO đọc từ DB cho một hóa đơn (chống truy vấn quá lớn). */
++    private int maxScannedPoLines = 500;
++
++    /** Bỏ ứng viên có điểm tổng dưới ngưỡng này (0 = giữ tất cả). */
++    private BigDecimal minScore = BigDecimal.ZERO;
++
++    @PostConstruct
++    public void validate() {
++        if (maxPerLine <= 0) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "tmw.matching.candidate.max-per-line phải > 0");
++        }
++        if (maxScannedPoLines <= 0 || maxScannedPoLines > PoLineCandidateQuery.MAX_LIMIT) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR,
++                    "tmw.matching.candidate.max-scanned-po-lines phải trong khoảng 1.." + PoLineCandidateQuery.MAX_LIMIT);
++        }
++        if (minScore == null || minScore.signum() < 0 || minScore.compareTo(BigDecimal.ONE) > 0) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "tmw.matching.candidate.min-score phải trong khoảng 0..1");
++        }
++    }
++}
+diff --git a/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateSearchRequest.java b/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateSearchRequest.java
+new file mode 100644
+index 0000000..baa793b
+--- /dev/null
++++ b/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateSearchRequest.java
+@@ -0,0 +1,81 @@
++package com.tmw.backend.matching.candidate;
++
++import com.tmw.backend.common.error.BusinessException;
++import com.tmw.backend.common.error.ErrorCode;
++import com.tmw.backend.matching.variance.ToleranceThreshold;
++
++import java.math.BigDecimal;
++import java.time.LocalDate;
++import java.util.List;
++import java.util.UUID;
++
++/**
++ * Yêu cầu tìm ứng viên cho một hóa đơn. Ở giai đoạn 3, match-runs dựng đối tượng này từ Invoice/InvoiceLine.
++ *
++ * @param poReference         số PO in trên hóa đơn (chuỗi); null nếu không có (chờ BE-4 thêm invoice.po_reference)
++ * @param purchaseOrderIdHint invoice.purchase_order_id nếu người nhập đã chọn PO
++ * @param tolerance           ngưỡng dung sai (từ ToleranceEvaluationService của BE-2); null = chưa có chính sách,
++ *                            khi đó coi như require_grn = true và dung sai 0%
++ */
++public record CandidateSearchRequest(
++        UUID invoiceId,
++        UUID supplierId,
++        LocalDate issueDate,
++        String currency,
++        String poReference,
++        UUID purchaseOrderIdHint,
++        ToleranceThreshold tolerance,
++        List<InvoiceLineToMatch> lines
++) {
++    public CandidateSearchRequest {
++        if (supplierId == null) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "supplierId của hóa đơn không được để trống");
++        }
++        if (issueDate == null) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "issueDate của hóa đơn không được để trống");
++        }
++        lines = lines == null ? List.of() : List.copyOf(lines);
++    }
++
++    /** Thiếu chính sách thì mặc định yêu cầu GRN (an toàn hơn cho đối chiếu 3 chiều). */
++    public boolean requireGrn() {
++        return tolerance == null || tolerance.requireGrn();
++    }
++
++    public BigDecimal qtyTolerancePct() {
++        return tolerance == null ? null : tolerance.qtyTolerancePct();
++    }
++
++    public BigDecimal priceTolerancePct() {
++        return tolerance == null ? null : tolerance.priceTolerancePct();
++    }
++
++    /**
++     * Một dòng hóa đơn cần ghép.
++     *
++     * @param unmatchedQty số lượng còn chưa ghép (invoice_line.qty − matched_qty), phải &gt; 0
++     * @param poLineIdHint invoice_line.po_line_id nếu có
++     */
++    public record InvoiceLineToMatch(
++            UUID invoiceLineId,
++            int lineNo,
++            String itemCode,
++            BigDecimal unmatchedQty,
++            BigDecimal unitPrice,
++            UUID poLineIdHint
++    ) {
++        public InvoiceLineToMatch {
++            if (invoiceLineId == null) {
++                throw new BusinessException(ErrorCode.VALIDATION_ERROR, "invoiceLineId không được để trống");
++            }
++            if (unmatchedQty == null || unmatchedQty.signum() <= 0) {
++                throw new BusinessException(ErrorCode.VALIDATION_ERROR,
++                        "Số lượng chưa ghép của dòng hóa đơn " + lineNo + " phải lớn hơn 0");
++            }
++            if (unitPrice == null || unitPrice.signum() < 0) {
++                throw new BusinessException(ErrorCode.VALIDATION_ERROR,
++                        "Đơn giá dòng hóa đơn " + lineNo + " không được null hoặc âm");
++            }
++        }
++    }
++}
+diff --git a/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateSearchResult.java b/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateSearchResult.java
+new file mode 100644
+index 0000000..dc40922
+--- /dev/null
++++ b/backend/src/main/java/com/tmw/backend/matching/candidate/CandidateSearchResult.java
+@@ -0,0 +1,81 @@
++package com.tmw.backend.matching.candidate;
++
++import com.tmw.backend.matching.scoring.ConfidenceBreakdown;
++
++import java.math.BigDecimal;
++import java.time.LocalDate;
++import java.util.List;
++import java.util.Optional;
++import java.util.UUID;
++
++/**
++ * Kết quả CandidateFinder: với mỗi dòng hóa đơn, danh sách dòng PO ứng viên đã xếp hạng (rank 1 = tốt nhất).
++ *
++ * <p>CandidateFinder KHÔNG phân bổ: cùng một dòng PO có thể xuất hiện ở nhiều dòng hóa đơn
++ * (nhiều-một). Việc chia số lượng giữa các dòng là của bộ phân bổ ở giai đoạn 3
++ * (xem docs/be5/thiet-ke-phan-bo-mot-nhieu-nhieu-mot.md).</p>
++ *
++ * @param scannedPoLines số dòng PO đọc từ DB (để theo dõi hiệu năng)
++ */
++public record CandidateSearchResult(
++        UUID invoiceId,
++        List<LineCandidates> lines,
++        int scannedPoLines
++) {
++    public CandidateSearchResult {
++        lines = List.copyOf(lines);
++    }
++
++    public static CandidateSearchResult empty(UUID invoiceId) {
++        return new CandidateSearchResult(invoiceId, List.of(), 0);
++    }
++
++    public Optional<LineCandidates> forInvoiceLine(UUID invoiceLineId) {
++        return lines.stream().filter(l -> l.invoiceLineId().equals(invoiceLineId)).findFirst();
++    }
++
++    /** Dòng hóa đơn không có ứng viên nào → engine sinh MISSING_PO ở giai đoạn 3. */
++    public List<LineCandidates> linesWithoutCandidates() {
++        return lines.stream().filter(l -> l.candidates().isEmpty()).toList();
++    }
++
++    public record LineCandidates(
++            UUID invoiceLineId,
++            int lineNo,
++            List<RankedCandidate> candidates
++    ) {
++        public LineCandidates {
++            candidates = List.copyOf(candidates);
++        }
++
++        public Optional<RankedCandidate> best() {
++            return candidates.isEmpty() ? Optional.empty() : Optional.of(candidates.get(0));
++        }
++    }
++
++    /**
++     * @param poRemainingQty  vế PO: ordered − allocated − reserved
++     * @param grnRemainingQty vế GRN: received − allocated − reserved (không âm)
++     * @param availableQty    số lượng có thể ghép: min(vế PO, vế GRN) nếu require_grn, ngược lại vế PO
++     * @param missingGrn      require_grn nhưng dòng PO chưa có số lượng nhận kho khả dụng → MISSING_GRN ở GĐ3
++     */
++    public record RankedCandidate(
++            int rank,
++            UUID purchaseOrderId,
++            String poNumber,
++            LocalDate orderDate,
++            UUID poLineId,
++            int poLineNo,
++            String itemCode,
++            BigDecimal poUnitPrice,
++            BigDecimal poRemainingQty,
++            BigDecimal grnRemainingQty,
++            BigDecimal availableQty,
++            boolean missingGrn,
++            ConfidenceBreakdown confidence
++    ) {
++        public BigDecimal score() {
++            return confidence.overallScore();
++        }
++    }
++}
+diff --git a/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceInput.java b/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceInput.java
+index 4a696ad..c4cd003 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceInput.java
++++ b/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceInput.java
+@@ -5,16 +5,23 @@ import java.util.UUID;
+ 
+ /**
+  * Dữ liệu chấm điểm tin cậy cho một cặp (dòng hóa đơn ↔ dòng PO ứng viên).
++ * Mọi trường đều có thể null; thiếu dữ liệu thì tiêu chí tương ứng được điểm thấp, không ném lỗi.
+  *
+- * @param invoicePoReference      số PO in trên hóa đơn (chuỗi, vd "PO-2026-0012"); null/blank nếu hóa đơn không ghi
+- * @param invoiceLinePoLineIdHint gợi ý dòng PO ở cấp dòng hóa đơn (nếu người nhập đã chỉ định), có thể null
+- * @param candidatePoNumber       purchase_order.po_number của PO ứng viên
+- * @param candidatePoLineId       id dòng PO ứng viên
++ * @param invoicePoReference      số PO in trên hóa đơn (chuỗi, vd "PO-2026-0012")
++ * @param invoicePoIdHint         PO gợi ý ở header hóa đơn (invoice.purchase_order_id)
++ * @param invoiceLinePoLineIdHint dòng PO gợi ý ở dòng hóa đơn (invoice_line.po_line_id)
++ * @param candidatePoNumber       purchase_order.po_number của ứng viên
++ * @param candidatePoId           purchase_order.id của ứng viên
++ * @param candidatePoLineId       po_line.id của ứng viên
++ * @param priceVariancePct        |giá HĐ − giá PO| / giá PO × 100
++ * @param qtyVariancePct          phần trăm số lượng hóa đơn KHÔNG được ứng viên đáp ứng (0 = đủ)
+  */
+ public record ConfidenceInput(
+         String invoicePoReference,
++        UUID invoicePoIdHint,
+         UUID invoiceLinePoLineIdHint,
+         String candidatePoNumber,
++        UUID candidatePoId,
+         UUID candidatePoLineId,
+         UUID invoiceSupplierId,
+         UUID poSupplierId,
+@@ -25,4 +32,52 @@ public record ConfidenceInput(
+         BigDecimal qtyVariancePct,
+         BigDecimal qtyTolerancePct
+ ) {
++
++    public static Builder builder() {
++        return new Builder();
++    }
++
++    public static final class Builder {
++        private String invoicePoReference;
++        private UUID invoicePoIdHint;
++        private UUID invoiceLinePoLineIdHint;
++        private String candidatePoNumber;
++        private UUID candidatePoId;
++        private UUID candidatePoLineId;
++        private UUID invoiceSupplierId;
++        private UUID poSupplierId;
++        private String invoiceItemCode;
++        private String poItemCode;
++        private BigDecimal priceVariancePct;
++        private BigDecimal priceTolerancePct;
++        private BigDecimal qtyVariancePct;
++        private BigDecimal qtyTolerancePct;
++
++        private Builder() {
++        }
++
++        public Builder invoicePoReference(String v) { this.invoicePoReference = v; return this; }
++        public Builder invoicePoIdHint(UUID v) { this.invoicePoIdHint = v; return this; }
++        public Builder invoiceLinePoLineIdHint(UUID v) { this.invoiceLinePoLineIdHint = v; return this; }
++        public Builder candidatePoNumber(String v) { this.candidatePoNumber = v; return this; }
++        public Builder candidatePoId(UUID v) { this.candidatePoId = v; return this; }
++        public Builder candidatePoLineId(UUID v) { this.candidatePoLineId = v; return this; }
++        public Builder invoiceSupplierId(UUID v) { this.invoiceSupplierId = v; return this; }
++        public Builder poSupplierId(UUID v) { this.poSupplierId = v; return this; }
++        public Builder invoiceItemCode(String v) { this.invoiceItemCode = v; return this; }
++        public Builder poItemCode(String v) { this.poItemCode = v; return this; }
++        public Builder priceVariancePct(BigDecimal v) { this.priceVariancePct = v; return this; }
++        public Builder priceTolerancePct(BigDecimal v) { this.priceTolerancePct = v; return this; }
++        public Builder qtyVariancePct(BigDecimal v) { this.qtyVariancePct = v; return this; }
++        public Builder qtyTolerancePct(BigDecimal v) { this.qtyTolerancePct = v; return this; }
++
++        public ConfidenceInput build() {
++            return new ConfidenceInput(
++                    invoicePoReference, invoicePoIdHint, invoiceLinePoLineIdHint,
++                    candidatePoNumber, candidatePoId, candidatePoLineId,
++                    invoiceSupplierId, poSupplierId, invoiceItemCode, poItemCode,
++                    priceVariancePct, priceTolerancePct, qtyVariancePct, qtyTolerancePct
++            );
++        }
++    }
+ }
+diff --git a/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceScorer.java b/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceScorer.java
+index cb3b3af..2e3dbc3 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceScorer.java
++++ b/backend/src/main/java/com/tmw/backend/matching/scoring/ConfidenceScorer.java
+@@ -65,9 +65,10 @@ public class ConfidenceScorer {
+ 
+     /**
+      * Tiêu chí số PO:
+-     * - Dòng hóa đơn chỉ định đúng dòng PO ứng viên, hoặc số PO trên hóa đơn trùng po_number -> 1.0
+-     * - Hóa đơn không ghi số PO và không chỉ định dòng PO (tự dò theo nhà cung cấp)           -> 0.5
+-     * - Có ghi nhưng không khớp                                                               -> 0.0
++     * - Dòng hóa đơn chỉ định đúng dòng PO ứng viên, số PO trên hóa đơn trùng po_number,
++     *   hoặc PO gợi ý ở header hóa đơn trùng PO ứng viên                                      -> 1.0
++     * - Hóa đơn không có bất kỳ gợi ý PO nào (tự dò theo nhà cung cấp)                         -> 0.5
++     * - Có gợi ý nhưng không khớp ứng viên                                                    -> 0.0
+      * So sánh số PO sau khi bỏ khoảng trắng hai đầu và không phân biệt hoa/thường
+      * (PurchaseOrder lưu po_number dạng chữ hoa).
+      */
+@@ -81,7 +82,10 @@ public class ConfidenceScorer {
+         if (invoiceRef != null && invoiceRef.equals(candidatePoNumber)) {
+             return ONE;
+         }
+-        if (invoiceRef == null && input.invoiceLinePoLineIdHint() == null) {
++        if (input.invoicePoIdHint() != null && input.invoicePoIdHint().equals(input.candidatePoId())) {
++            return ONE;
++        }
++        if (invoiceRef == null && input.invoicePoIdHint() == null && input.invoiceLinePoLineIdHint() == null) {
+             return HALF;
+         }
+         return ZERO;
+diff --git a/backend/src/main/java/com/tmw/backend/matching/strategy/MatchingContext.java b/backend/src/main/java/com/tmw/backend/matching/strategy/MatchingContext.java
+index 5f7ca35..2d664a1 100644
+--- a/backend/src/main/java/com/tmw/backend/matching/strategy/MatchingContext.java
++++ b/backend/src/main/java/com/tmw/backend/matching/strategy/MatchingContext.java
+@@ -12,6 +12,7 @@ public record MatchingContext(
+         UUID invoiceId,
+         UUID invoiceSupplierId,
+         String invoicePoReference,
++        UUID invoicePoIdHint,
+         CurrencyCode currency,
+         MatchSource source,
+         ToleranceThreshold tolerance,
+diff --git a/backend/src/main/java/com/tmw/backend/purchaseorder/api/PoLineCandidateQuery.java b/backend/src/main/java/com/tmw/backend/purchaseorder/api/PoLineCandidateQuery.java
+new file mode 100644
+index 0000000..b37eb98
+--- /dev/null
++++ b/backend/src/main/java/com/tmw/backend/purchaseorder/api/PoLineCandidateQuery.java
+@@ -0,0 +1,82 @@
++package com.tmw.backend.purchaseorder.api;
++
++import com.tmw.backend.common.error.BusinessException;
++import com.tmw.backend.common.error.ErrorCode;
++
++import java.time.LocalDate;
++import java.util.Collection;
++import java.util.Locale;
++import java.util.Objects;
++import java.util.Set;
++import java.util.UUID;
++import java.util.stream.Collectors;
++
++/**
++ * Điều kiện tìm dòng PO ứng viên.
++ *
++ * <p>Một dòng PO được lấy nếu thỏa điều kiện chung (nhà cung cấp, trạng thái, ngày, tiền tệ, còn hạn mức)
++ * VÀ ít nhất một trong các điều kiện: trùng mã hàng, là dòng được gợi ý, thuộc PO có số trùng
++ * {@code poNumber}, hoặc thuộc PO {@code purchaseOrderId}.</p>
++ *
++ * @param supplierId      bắt buộc
++ * @param orderDateTo     bắt buộc: chỉ lấy PO có order_date &lt;= ngày này (thường là issue_date của hóa đơn)
++ * @param currency        mã tiền tệ (vd "VND"); null = không lọc
++ * @param itemCodes       mã hàng trên hóa đơn (tự chuẩn hóa trim + chữ hoa như po_line.item_code)
++ * @param poLineIds       dòng PO được gợi ý trực tiếp trên dòng hóa đơn (invoice_line.po_line_id)
++ * @param poNumber        số PO in trên hóa đơn (chuỗi); null nếu không có
++ * @param purchaseOrderId PO được gợi ý ở header hóa đơn (invoice.purchase_order_id); null nếu không có
++ * @param limit           số dòng tối đa trả về (1..1000)
++ */
++public record PoLineCandidateQuery(
++        UUID supplierId,
++        LocalDate orderDateTo,
++        String currency,
++        Set<String> itemCodes,
++        Set<UUID> poLineIds,
++        String poNumber,
++        UUID purchaseOrderId,
++        int limit
++) {
++    public static final int MAX_LIMIT = 1000;
++
++    public PoLineCandidateQuery {
++        if (supplierId == null) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "supplierId không được để trống");
++        }
++        if (orderDateTo == null) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "orderDateTo không được để trống");
++        }
++        if (limit <= 0 || limit > MAX_LIMIT) {
++            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "limit phải nằm trong khoảng 1.." + MAX_LIMIT);
++        }
++        currency = blankToNull(currency) == null ? null : currency.trim().toUpperCase(Locale.ROOT);
++        itemCodes = normalizeCodes(itemCodes);
++        poLineIds = poLineIds == null ? Set.of()
++                : poLineIds.stream().filter(Objects::nonNull).collect(Collectors.toUnmodifiableSet());
++        poNumber = blankToNull(poNumber) == null ? null : poNumber.trim().toUpperCase(Locale.ROOT);
++    }
++
++    /** Không có tiêu chí "hoặc" nào → chắc chắn không có ứng viên, khỏi truy vấn DB. */
++    public boolean hasNoSelector() {
++        return itemCodes.isEmpty() && poLineIds.isEmpty() && poNumber == null && purchaseOrderId == null;
++    }
++
++    public static String normalizeItemCode(String code) {
++        String trimmed = blankToNull(code);
++        return trimmed == null ? null : trimmed.toUpperCase(Locale.ROOT);
++    }
++
++    private static Set<String> normalizeCodes(Collection<String> codes) {
++        if (codes == null) {
++            return Set.of();
++        }
++        return codes.stream()
++                .map(PoLineCandidateQuery::normalizeItemCode)
++                .filter(Objects::nonNull)
++                .collect(Collectors.toUnmodifiableSet());
++    }
++
++    private static String blankToNull(String s) {
++        return (s == null || s.isBlank()) ? null : s.trim();
++    }
++}
+diff --git a/backend/src/main/java/com/tmw/backend/purchaseorder/api/PoLineCandidateView.java b/backend/src/main/java/com/tmw/backend/purchaseorder/api/PoLineCandidateView.java
+new file mode 100644
+index 0000000..649cba0
+--- /dev/null
++++ b/backend/src/main/java/com/tmw/backend/purchaseorder/api/PoLineCandidateView.java
+@@ -0,0 +1,39 @@
++package com.tmw.backend.purchaseorder.api;
++
++import java.math.BigDecimal;
++import java.time.LocalDate;
++import java.util.UUID;
++
++/**
++ * Một dòng PO ứng viên kèm số liệu hạn mức tại thời điểm đọc (chưa khóa dòng).
++ * Số liệu chỉ để xếp hạng; giữ chỗ thật vẫn phải qua CapacityAllocationService (khóa po_line_capacity).
++ */
++public record PoLineCandidateView(
++        UUID purchaseOrderId,
++        String poNumber,
++        UUID supplierId,
++        LocalDate orderDate,
++        String status,
++        String currency,
++        UUID poLineId,
++        int lineNo,
++        String itemCode,
++        BigDecimal unitPrice,
++        BigDecimal vatRate,
++        BigDecimal orderedQty,
++        BigDecimal allocatedQty,
++        BigDecimal reservedQty,
++        BigDecimal receivedQty
++) {
++
++    /** Vế PO: ordered - allocated - reserved. */
++    public BigDecimal remainingQty() {
++        return orderedQty.subtract(allocatedQty).subtract(reservedQty);
++    }
++
++    /** Vế GRN: received - allocated - reserved, không âm (số lượng đã nhận kho mà chưa ghép). */
++    public BigDecimal grnRemainingQty() {
++        BigDecimal value = receivedQty.subtract(allocatedQty).subtract(reservedQty);
++        return value.signum() < 0 ? BigDecimal.ZERO.setScale(value.scale()) : value;
++    }
++}
+diff --git a/backend/src/main/java/com/tmw/backend/purchaseorder/api/PurchaseOrderQueryApi.java b/backend/src/main/java/com/tmw/backend/purchaseorder/api/PurchaseOrderQueryApi.java
+new file mode 100644
+index 0000000..069772b
+--- /dev/null
++++ b/backend/src/main/java/com/tmw/backend/purchaseorder/api/PurchaseOrderQueryApi.java
+@@ -0,0 +1,23 @@
++package com.tmw.backend.purchaseorder.api;
++
++import java.util.List;
++
++/**
++ * Truy vấn chỉ-đọc PO và số dư hạn mức cho engine ghép (mục 1.3 bản phân công v2).
++ *
++ * <p>Chủ sở hữu: BE-3. Chữ ký và bản cài đặt JDBC đầu tiên do BE-5 đề xuất ở giai đoạn 2
++ * để CandidateFinder không bị chặn; BE-3 review và tiếp quản.</p>
++ */
++public interface PurchaseOrderQueryApi {
++
++    /**
++     * Tìm các dòng PO ứng viên của một nhà cung cấp cho việc ghép hóa đơn.
++     *
++     * <p>Chỉ trả dòng thuộc PO đang mở (OPEN, PARTIALLY_INVOICED), đặt trước hoặc trong ngày hóa đơn,
++     * cùng loại tiền, và còn hạn mức PO (ordered - allocated - reserved &gt; 0). Không lọc theo vế GRN:
++     * dòng chưa nhận hàng vẫn được trả để engine sinh MISSING_GRN.</p>
++     *
++     * <p>Thứ tự: order_date tăng dần (PO cũ trước), rồi po_number, line_no.</p>
++     */
++    List<PoLineCandidateView> findCandidateLines(PoLineCandidateQuery query);
++}
+diff --git a/backend/src/main/java/com/tmw/backend/purchaseorder/service/JdbcPurchaseOrderQueryService.java b/backend/src/main/java/com/tmw/backend/purchaseorder/service/JdbcPurchaseOrderQueryService.java
+new file mode 100644
+index 0000000..0fe7690
+--- /dev/null
++++ b/backend/src/main/java/com/tmw/backend/purchaseorder/service/JdbcPurchaseOrderQueryService.java
+@@ -0,0 +1,91 @@
++package com.tmw.backend.purchaseorder.service;
++
++import com.tmw.backend.purchaseorder.api.PoLineCandidateQuery;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateView;
++import com.tmw.backend.purchaseorder.api.PurchaseOrderQueryApi;
++import org.springframework.core.io.ClassPathResource;
++import org.springframework.jdbc.core.RowMapper;
++import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
++import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
++import org.springframework.stereotype.Service;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.UncheckedIOException;
++import java.nio.charset.StandardCharsets;
++import java.sql.Types;
++import java.time.LocalDate;
++import java.util.Collection;
++import java.util.List;
++import java.util.UUID;
++
++/**
++ * Cài đặt PurchaseOrderQueryApi bằng một câu SQL thuần (đọc từ classpath) để kiểm soát được kế hoạch
++ * thực thi và index. Đọc không khóa: số dư chỉ để xếp hạng ứng viên.
++ *
++ * <p>Đề xuất của BE-5 cho BE-3 (xem PurchaseOrderQueryApi).</p>
++ */
++@Service
++public class JdbcPurchaseOrderQueryService implements PurchaseOrderQueryApi {
++
++    static final String SQL_RESOURCE = "sql/purchaseorder/find-candidate-po-lines.sql";
++
++    /** IN () rỗng là cú pháp sai trong SQL → thay bằng giá trị không bao giờ khớp. */
++    private static final String NO_ITEM_CODE = "#NO-ITEM-CODE#";
++    private static final UUID NO_UUID = new UUID(0L, 0L);
++
++    private static final RowMapper<PoLineCandidateView> ROW_MAPPER = (rs, rowNum) -> new PoLineCandidateView(
++            rs.getObject("purchase_order_id", UUID.class),
++            rs.getString("po_number"),
++            rs.getObject("supplier_id", UUID.class),
++            rs.getObject("order_date", LocalDate.class),
++            rs.getString("status"),
++            rs.getString("currency"),
++            rs.getObject("po_line_id", UUID.class),
++            rs.getInt("line_no"),
++            rs.getString("item_code"),
++            rs.getBigDecimal("unit_price"),
++            rs.getBigDecimal("vat_rate"),
++            rs.getBigDecimal("ordered_qty"),
++            rs.getBigDecimal("allocated_qty"),
++            rs.getBigDecimal("reserved_qty"),
++            rs.getBigDecimal("received_qty")
++    );
++
++    private final NamedParameterJdbcTemplate jdbc;
++    private final String sql;
++
++    public JdbcPurchaseOrderQueryService(NamedParameterJdbcTemplate jdbc) {
++        this.jdbc = jdbc;
++        this.sql = loadSql();
++    }
++
++    @Override
++    public List<PoLineCandidateView> findCandidateLines(PoLineCandidateQuery query) {
++        if (query.hasNoSelector()) {
++            return List.of();
++        }
++        MapSqlParameterSource params = new MapSqlParameterSource()
++                .addValue("supplierId", query.supplierId())
++                .addValue("orderDateTo", query.orderDateTo())
++                .addValue("currency", query.currency(), Types.VARCHAR)
++                .addValue("itemCodes", orSentinel(query.itemCodes(), NO_ITEM_CODE))
++                .addValue("poLineIds", orSentinel(query.poLineIds(), NO_UUID))
++                .addValue("poNumber", query.poNumber(), Types.VARCHAR)
++                .addValue("purchaseOrderId", query.purchaseOrderId(), Types.OTHER)
++                .addValue("limit", query.limit());
++        return jdbc.query(sql, params, ROW_MAPPER);
++    }
++
++    private static <T> Collection<T> orSentinel(Collection<T> values, T sentinel) {
++        return values.isEmpty() ? List.of(sentinel) : values;
++    }
++
++    static String loadSql() {
++        try (InputStream in = new ClassPathResource(SQL_RESOURCE).getInputStream()) {
++            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
++        } catch (IOException e) {
++            throw new UncheckedIOException("Không đọc được " + SQL_RESOURCE, e);
++        }
++    }
++}
+diff --git a/backend/src/main/resources/db/migration/R__matching_candidate_finder_indexes.sql b/backend/src/main/resources/db/migration/R__matching_candidate_finder_indexes.sql
+new file mode 100644
+index 0000000..dd954dd
+--- /dev/null
++++ b/backend/src/main/resources/db/migration/R__matching_candidate_finder_indexes.sql
+@@ -0,0 +1,22 @@
++-- =============================================================================
++-- BE-5 · Matching · Index hỗ trợ CandidateFinder (PurchaseOrderQueryApi.findCandidateLines)
++--
++-- Repeatable migration (R__): Flyway luôn chạy file này SAU mọi migration V__, nên các bảng
++-- purchase_order / po_line / po_line_capacity của BE-3 chắc chắn đã tồn tại, dù họ đặt
++-- timestamp migration sau BE-5. Sửa file này thì Flyway tự chạy lại (IF NOT EXISTS → an toàn).
++--
++-- Đo trên PostgreSQL 16 với 1.000 PO / 5.000 dòng (xem docs/be5/candidate-finder-performance.md).
++-- =============================================================================
++
++-- Lọc PO theo nhà cung cấp + trạng thái mở + ngày đặt; INCLUDE để đọc po_number/currency không cần heap.
++CREATE INDEX IF NOT EXISTS idx_purchase_order_supplier_status_date
++    ON purchase_order (supplier_id, status, order_date)
++    INCLUDE (po_number, currency);
++
++-- Nối PO → dòng và lọc mã hàng trong cùng một index.
++CREATE INDEX IF NOT EXISTS idx_po_line_po_item
++    ON po_line (purchase_order_id, item_code);
++
++-- Tra dòng PO theo mã hàng (dùng cho các truy vấn theo item_code không qua PO).
++CREATE INDEX IF NOT EXISTS idx_po_line_item_code
++    ON po_line (item_code);
+diff --git a/backend/src/main/resources/sql/purchaseorder/find-candidate-po-lines.sql b/backend/src/main/resources/sql/purchaseorder/find-candidate-po-lines.sql
+new file mode 100644
+index 0000000..92626d9
+--- /dev/null
++++ b/backend/src/main/resources/sql/purchaseorder/find-candidate-po-lines.sql
+@@ -0,0 +1,33 @@
++-- PurchaseOrderQueryApi.findCandidateLines
++-- Index hỗ trợ: db/migration/R__matching_candidate_finder_indexes.sql
++SELECT po.id               AS purchase_order_id,
++       po.po_number        AS po_number,
++       po.supplier_id      AS supplier_id,
++       po.order_date       AS order_date,
++       po.status           AS status,
++       po.currency         AS currency,
++       pl.id               AS po_line_id,
++       pl.line_no          AS line_no,
++       pl.item_code        AS item_code,
++       pl.unit_price       AS unit_price,
++       pl.vat_rate         AS vat_rate,
++       c.ordered_qty       AS ordered_qty,
++       c.allocated_qty     AS allocated_qty,
++       c.reserved_qty      AS reserved_qty,
++       c.received_qty      AS received_qty
++FROM purchase_order po
++JOIN po_line pl          ON pl.purchase_order_id = po.id
++JOIN po_line_capacity c  ON c.po_line_id = pl.id
++WHERE po.supplier_id = :supplierId
++  AND po.status IN ('OPEN', 'PARTIALLY_INVOICED')
++  AND po.order_date <= :orderDateTo
++  AND (CAST(:currency AS VARCHAR) IS NULL OR po.currency = CAST(:currency AS VARCHAR))
++  AND c.ordered_qty - c.allocated_qty - c.reserved_qty > 0
++  AND (
++        pl.item_code IN (:itemCodes)
++     OR pl.id IN (:poLineIds)
++     OR po.po_number = CAST(:poNumber AS VARCHAR)
++     OR po.id = CAST(:purchaseOrderId AS UUID)
++  )
++ORDER BY po.order_date ASC, po.po_number ASC, pl.line_no ASC
++LIMIT :limit
+diff --git a/backend/src/test/java/com/tmw/backend/matching/candidate/CandidateFinderPerformanceIntegrationTest.java b/backend/src/test/java/com/tmw/backend/matching/candidate/CandidateFinderPerformanceIntegrationTest.java
+new file mode 100644
+index 0000000..6b42905
+--- /dev/null
++++ b/backend/src/test/java/com/tmw/backend/matching/candidate/CandidateFinderPerformanceIntegrationTest.java
+@@ -0,0 +1,205 @@
++package com.tmw.backend.matching.candidate;
++
++import com.tmw.backend.matching.candidate.CandidateSearchRequest.InvoiceLineToMatch;
++import com.tmw.backend.matching.scoring.ConfidenceScorer;
++import com.tmw.backend.matching.scoring.ConfidenceWeightProperties;
++import com.tmw.backend.matching.variance.ToleranceThreshold;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateQuery;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateView;
++import com.tmw.backend.purchaseorder.service.JdbcPurchaseOrderQueryService;
++import com.tmw.backend.testinfra.PostgresContainerBase;
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.springframework.core.io.ClassPathResource;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
++import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
++import org.springframework.jdbc.datasource.SingleConnectionDataSource;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.math.BigDecimal;
++import java.nio.charset.StandardCharsets;
++import java.time.LocalDate;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Random;
++import java.util.Set;
++import java.util.UUID;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++/**
++ * Đo CandidateFinder + JdbcPurchaseOrderQueryService trên PostgreSQL thật với 1.000 PO / 5.000 dòng
++ * (task giai đoạn 2 của BE-5). Dựng schema riêng từ bản sao bảng của BE-3 (test resource), nạp dữ liệu
++ * tất định, áp index của R__matching_candidate_finder_indexes.sql.
++ */
++class CandidateFinderPerformanceIntegrationTest extends PostgresContainerBase {
++
++    private static final LocalDate ISSUE_DATE = LocalDate.of(2026, 11, 27);
++    private static final ToleranceThreshold POLICY = new ToleranceThreshold(
++            new BigDecimal("2.0000"), new BigDecimal("1.0000"), null, true);
++    /** Ngưỡng nới rộng cho máy CI; đo thực tế trên PostgreSQL 16 khoảng 1 ms (xem docs/be5). */
++    private static final double P95_BUDGET_MS = 50.0;
++
++    private static String schema;
++    private static SingleConnectionDataSource dataSource;
++    private static NamedParameterJdbcTemplate jdbc;
++    private static JdbcPurchaseOrderQueryService poQuery;
++    private static CandidateFinder finder;
++
++    @BeforeAll
++    static void createSchemaSeedAndIndexes() throws IOException {
++        schema = "be5_perf_" + UUID.randomUUID().toString().replace("-", "");
++        SingleConnectionDataSource adminDs = new SingleConnectionDataSource(
++                POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword(), true);
++        new JdbcTemplate(adminDs).execute("CREATE SCHEMA " + schema);
++        adminDs.destroy();
++
++        String url = POSTGRES.getJdbcUrl() + (POSTGRES.getJdbcUrl().contains("?") ? "&" : "?") + "currentSchema=" + schema;
++        dataSource = new SingleConnectionDataSource(url, POSTGRES.getUsername(), POSTGRES.getPassword(), true);
++        jdbc = new NamedParameterJdbcTemplate(dataSource);
++        JdbcTemplate plain = jdbc.getJdbcTemplate();
++        plain.execute(read("matching/candidate-finder-schema.sql"));
++        plain.execute(read("matching/candidate-finder-seed-1000-po.sql"));
++        plain.execute(read("db/migration/R__matching_candidate_finder_indexes.sql"));
++        plain.execute("ANALYZE");
++
++        ConfidenceWeightProperties weights = new ConfidenceWeightProperties();
++        weights.validateWeights();
++        CandidateFinderProperties props = new CandidateFinderProperties();
++        props.validate();
++        poQuery = new JdbcPurchaseOrderQueryService(jdbc);
++        finder = new CandidateFinder(poQuery, new ConfidenceScorer(weights), props);
++    }
++
++    @AfterAll
++    static void dropSchema() {
++        if (jdbc != null) {
++            jdbc.getJdbcTemplate().execute("DROP SCHEMA IF EXISTS " + schema + " CASCADE");
++        }
++        if (dataSource != null) {
++            dataSource.destroy();
++        }
++    }
++
++    @Test
++    void seedShouldContain1000PurchaseOrders() {
++        Integer count = jdbc.getJdbcTemplate().queryForObject("SELECT count(*) FROM purchase_order", Integer.class);
++        assertThat(count).isEqualTo(1000);
++    }
++
++    @Test
++    void shouldReturnOnlyOpenLinesOfSupplierWithRemainingCapacityInFifoOrder() {
++        UUID supplier = supplier(1);
++        List<String> codes = itemCodesOf(supplier);
++        List<PoLineCandidateView> rows = poQuery.findCandidateLines(new PoLineCandidateQuery(
++                supplier, ISSUE_DATE, "VND", Set.copyOf(codes), Set.of(), null, null, 500));
++
++        assertThat(rows).isNotEmpty();
++        assertThat(rows).allMatch(r -> r.supplierId().equals(supplier));
++        assertThat(rows).allMatch(r -> r.status().equals("OPEN") || r.status().equals("PARTIALLY_INVOICED"));
++        assertThat(rows).allMatch(r -> r.remainingQty().signum() > 0);
++        assertThat(rows).allMatch(r -> !r.orderDate().isAfter(ISSUE_DATE));
++        assertThat(rows).allMatch(r -> codes.contains(r.itemCode()));
++        for (int i = 1; i < rows.size(); i++) {
++            assertThat(rows.get(i - 1).orderDate().isAfter(rows.get(i).orderDate())).isFalse();
++        }
++    }
++
++    @Test
++    void shouldFindLinesByPoNumberOrPoIdWithoutItemCodes() {
++        // PO 1 (OPEN) thuộc nhà cung cấp 1
++        List<PoLineCandidateView> byNumber = poQuery.findCandidateLines(new PoLineCandidateQuery(
++                supplier(1), ISSUE_DATE, "VND", Set.of(), Set.of(), "po-2026-00001", null, 500));
++        assertThat(byNumber).isNotEmpty();
++        assertThat(byNumber).allMatch(r -> r.poNumber().equals("PO-2026-00001"));
++
++        UUID poId = byNumber.get(0).purchaseOrderId();
++        List<PoLineCandidateView> byId = poQuery.findCandidateLines(new PoLineCandidateQuery(
++                supplier(1), ISSUE_DATE, "VND", Set.of(), Set.of(), null, poId, 500));
++        assertThat(byId).hasSize(byNumber.size());
++    }
++
++    @Test
++    void shouldUseSupplierIndexInQueryPlan() {
++        UUID supplier = supplier(7);
++        MapSqlParameterSource params = new MapSqlParameterSource()
++                .addValue("supplierId", supplier)
++                .addValue("orderDateTo", ISSUE_DATE)
++                .addValue("currency", "VND")
++                .addValue("itemCodes", itemCodesOf(supplier).subList(0, 3))
++                .addValue("poLineIds", List.of(new UUID(0, 0)))
++                .addValue("poNumber", null, java.sql.Types.VARCHAR)
++                .addValue("purchaseOrderId", null, java.sql.Types.OTHER)
++                .addValue("limit", 500);
++        String plan = String.join("\n", jdbc.queryForList(
++                "EXPLAIN " + readUnchecked("sql/purchaseorder/find-candidate-po-lines.sql"), params, String.class));
++
++        assertThat(plan).contains("idx_purchase_order_supplier_status_date");
++    }
++
++    @Test
++    void candidateSearchFor300InvoicesShouldStayWithinBudget() {
++        Random random = new Random(42);
++        List<CandidateSearchRequest> workload = new ArrayList<>();
++        for (int i = 0; i < 300; i++) {
++            UUID supplier = supplier(1 + random.nextInt(50));
++            List<String> codes = new ArrayList<>(itemCodesOf(supplier));
++            Collections.shuffle(codes, random);
++            List<InvoiceLineToMatch> lines = new ArrayList<>();
++            for (int l = 0; l < 3; l++) {
++                lines.add(new InvoiceLineToMatch(UUID.randomUUID(), l + 1, codes.get(l),
++                        BigDecimal.valueOf(1 + random.nextInt(20)), BigDecimal.valueOf(1000L * (1 + random.nextInt(50))), null));
++            }
++            workload.add(new CandidateSearchRequest(UUID.randomUUID(), supplier, ISSUE_DATE, "VND",
++                    null, null, POLICY, lines));
++        }
++        workload.subList(0, 20).forEach(finder::find); // làm nóng
++
++        List<Double> millis = new ArrayList<>();
++        int found = 0;
++        for (CandidateSearchRequest request : workload) {
++            long start = System.nanoTime();
++            CandidateSearchResult result = finder.find(request);
++            millis.add((System.nanoTime() - start) / 1_000_000.0);
++            found += (int) result.lines().stream().filter(l -> !l.candidates().isEmpty()).count();
++        }
++        Collections.sort(millis);
++        double p50 = millis.get(millis.size() / 2);
++        double p95 = millis.get((int) (millis.size() * 0.95));
++        System.out.printf("CandidateFinder 1.000 PO: p50=%.2f ms, p95=%.2f ms, max=%.2f ms, %d/%d dòng HĐ có ứng viên%n",
++                p50, p95, millis.get(millis.size() - 1), found, workload.size() * 3);
++
++        assertThat(found).isGreaterThan(0);
++        assertThat(p95 < P95_BUDGET_MS).isTrue();
++    }
++
++    // ------------------------------------------------------------------ helpers
++
++    private static UUID supplier(int s) {
++        return UUID.fromString(String.format("00000000-0000-4000-8000-%012d", s));
++    }
++
++    private static List<String> itemCodesOf(UUID supplier) {
++        return jdbc.getJdbcTemplate().queryForList(
++                "SELECT DISTINCT pl.item_code FROM po_line pl JOIN purchase_order po ON po.id = pl.purchase_order_id "
++                        + "WHERE po.supplier_id = ? ORDER BY 1", String.class, supplier);
++    }
++
++    private static String read(String resource) throws IOException {
++        try (InputStream in = new ClassPathResource(resource).getInputStream()) {
++            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
++        }
++    }
++
++    private static String readUnchecked(String resource) {
++        try {
++            return read(resource);
++        } catch (IOException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++}
+diff --git a/backend/src/test/java/com/tmw/backend/matching/candidate/CandidateFinderUnitTest.java b/backend/src/test/java/com/tmw/backend/matching/candidate/CandidateFinderUnitTest.java
+new file mode 100644
+index 0000000..627961d
+--- /dev/null
++++ b/backend/src/test/java/com/tmw/backend/matching/candidate/CandidateFinderUnitTest.java
+@@ -0,0 +1,259 @@
++package com.tmw.backend.matching.candidate;
++
++import com.tmw.backend.matching.candidate.CandidateSearchRequest.InvoiceLineToMatch;
++import com.tmw.backend.matching.candidate.CandidateSearchResult.LineCandidates;
++import com.tmw.backend.matching.candidate.CandidateSearchResult.RankedCandidate;
++import com.tmw.backend.matching.scoring.ConfidenceScorer;
++import com.tmw.backend.matching.scoring.ConfidenceWeightProperties;
++import com.tmw.backend.matching.variance.ToleranceThreshold;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateQuery;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateView;
++import com.tmw.backend.purchaseorder.api.PurchaseOrderQueryApi;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import java.math.BigDecimal;
++import java.time.LocalDate;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.UUID;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++class CandidateFinderUnitTest {
++
++    private static final UUID SUPPLIER = UUID.randomUUID();
++    private static final LocalDate ISSUE_DATE = LocalDate.of(2026, 11, 20);
++    private static final ToleranceThreshold THREE_WAY = new ToleranceThreshold(
++            new BigDecimal("2.0000"), new BigDecimal("1.0000"), null, true);
++    private static final ToleranceThreshold TWO_WAY = new ToleranceThreshold(
++            new BigDecimal("2.0000"), new BigDecimal("1.0000"), null, false);
++
++    private FakePurchaseOrderQueryApi poQuery;
++    private CandidateFinderProperties properties;
++    private CandidateFinder finder;
++
++    @BeforeEach
++    void setUp() {
++        ConfidenceWeightProperties weights = new ConfidenceWeightProperties();
++        weights.validateWeights();
++        properties = new CandidateFinderProperties();
++        properties.validate();
++        poQuery = new FakePurchaseOrderQueryApi();
++        finder = new CandidateFinder(poQuery, new ConfidenceScorer(weights), properties);
++    }
++
++    // ------------------------------------------------------------------ xếp hạng
++
++    @Test
++    void shouldRankPoReferenceMatchFirstThenOlderPoFirstOnEqualScore() {
++        PoLineCandidateView olderPo = poLine("PO-2026-00001", LocalDate.of(2026, 1, 5), 1, "ITEM-A", "100", "100", "50");
++        PoLineCandidateView newerPo = poLine("PO-2026-00002", LocalDate.of(2026, 3, 5), 1, "ITEM-A", "100", "100", "50");
++        PoLineCandidateView referencedPo = poLine("PO-2026-00003", LocalDate.of(2026, 6, 5), 1, "ITEM-A", "100", "100", "50");
++        poQuery.rows.addAll(List.of(newerPo, referencedPo, olderPo));
++
++        LineCandidates line = finder.find(request("PO-2026-00003", null, THREE_WAY,
++                invoiceLine("ITEM-A", "10", "100", null))).lines().get(0);
++
++        assertThat(line.candidates()).hasSize(3);
++        assertThat(line.candidates().get(0).poNumber()).isEqualTo("PO-2026-00003"); // khớp số PO → điểm cao nhất
++        assertThat(line.candidates().get(1).poNumber()).isEqualTo("PO-2026-00001"); // cùng điểm → PO cũ trước (FIFO)
++        assertThat(line.candidates().get(2).poNumber()).isEqualTo("PO-2026-00002");
++        assertThat(line.candidates().get(0).rank()).isEqualTo(1);
++        assertThat(line.candidates().get(2).rank()).isEqualTo(3);
++        assertNonIncreasingScores(line);
++    }
++
++    @Test
++    void shouldPreferCandidateWithEnoughQtyAndCloserPrice() {
++        PoLineCandidateView shortQty = poLine("PO-2026-00001", LocalDate.of(2026, 1, 1), 1, "ITEM-A", "100", "3", "3");
++        PoLineCandidateView priceOff = poLine("PO-2026-00002", LocalDate.of(2026, 1, 2), 1, "ITEM-A", "120", "100", "100");
++        PoLineCandidateView perfect = poLine("PO-2026-00003", LocalDate.of(2026, 1, 3), 1, "ITEM-A", "100", "100", "100");
++        poQuery.rows.addAll(List.of(shortQty, priceOff, perfect));
++
++        LineCandidates line = finder.find(request(null, null, THREE_WAY,
++                invoiceLine("ITEM-A", "10", "100", null))).lines().get(0);
++
++        assertThat(line.best().orElseThrow().poNumber()).isEqualTo("PO-2026-00003");
++        assertNonIncreasingScores(line);
++    }
++
++    // ------------------------------------------------------------------ vế GRN
++
++    @Test
++    void shouldFlagMissingGrnAndUsePoRemainingWhenGrnNotRequired() {
++        PoLineCandidateView notReceived = poLine("PO-2026-00001", LocalDate.of(2026, 1, 1), 1, "ITEM-A", "100", "100", "0");
++        poQuery.rows.add(notReceived);
++
++        RankedCandidate threeWay = finder.find(request(null, null, THREE_WAY,
++                invoiceLine("ITEM-A", "10", "100", null))).lines().get(0).best().orElseThrow();
++        assertThat(threeWay.missingGrn()).isTrue();
++        assertThat(threeWay.availableQty()).isEqualByComparingTo("0");
++        assertThat(threeWay.confidence().quantityScore()).isEqualByComparingTo("0.0000");
++
++        RankedCandidate twoWay = finder.find(request(null, null, TWO_WAY,
++                invoiceLine("ITEM-A", "10", "100", null))).lines().get(0).best().orElseThrow();
++        assertThat(twoWay.missingGrn()).isFalse();
++        assertThat(twoWay.availableQty()).isEqualByComparingTo("100");
++        assertThat(twoWay.confidence().quantityScore()).isEqualByComparingTo("1.0000");
++    }
++
++    @Test
++    void shouldComputeAvailableQtyAsMinOfPoAndGrnLegs() {
++        // ordered 100, allocated 30, reserved 10 → vế PO 60; received 50 → vế GRN 10
++        PoLineCandidateView view = new PoLineCandidateView(UUID.randomUUID(), "PO-1", SUPPLIER, ISSUE_DATE, "OPEN", "VND",
++                UUID.randomUUID(), 1, "ITEM-A", bd("100"), bd("0.1"), bd("100"), bd("30"), bd("10"), bd("50"));
++
++        assertThat(view.remainingQty()).isEqualByComparingTo("60");
++        assertThat(view.grnRemainingQty()).isEqualByComparingTo("10");
++        assertThat(CandidateFinder.availableQty(view, true)).isEqualByComparingTo("10");
++        assertThat(CandidateFinder.availableQty(view, false)).isEqualByComparingTo("60");
++    }
++
++    // ------------------------------------------------------------------ chọn dòng liên quan
++
++    @Test
++    void shouldIgnoreOtherItemsOfReferencedPoButKeepPartialCodesAndHintedLines() {
++        PoLineCandidateView exact = poLine("PO-2026-00001", LocalDate.of(2026, 1, 1), 1, "ITEM-A", "100", "100", "100");
++        PoLineCandidateView otherItem = poLine("PO-2026-00001", LocalDate.of(2026, 1, 1), 2, "ITEM-Z", "100", "100", "100");
++        PoLineCandidateView partialCode = poLine("PO-2026-00001", LocalDate.of(2026, 1, 1), 3, "ITEM-A-BOX", "100", "100", "100");
++        PoLineCandidateView hintedOtherCode = poLine("PO-2026-00001", LocalDate.of(2026, 1, 1), 4, "SKU-999", "100", "100", "100");
++        poQuery.rows.addAll(List.of(exact, otherItem, partialCode, hintedOtherCode));
++
++        LineCandidates line = finder.find(request("PO-2026-00001", null, THREE_WAY,
++                invoiceLine("ITEM-A", "10", "100", hintedOtherCode.poLineId()))).lines().get(0);
++
++        assertThat(line.candidates()).extracting(RankedCandidate::poLineNo).containsExactlyInAnyOrder(1, 3, 4);
++        assertThat(line.candidates()).noneMatch(c -> c.itemCode().equals("ITEM-Z"));
++    }
++
++    @Test
++    void shouldLetSamePoLineServeSeveralInvoiceLinesWithoutAllocating() {
++        PoLineCandidateView shared = poLine("PO-2026-00001", LocalDate.of(2026, 1, 1), 1, "ITEM-A", "100", "100", "100");
++        poQuery.rows.add(shared);
++
++        CandidateSearchResult result = finder.find(request(null, null, THREE_WAY,
++                invoiceLine("ITEM-A", "60", "100", null),
++                invoiceLine("ITEM-A", "60", "100", null)));
++
++        assertThat(result.lines()).hasSize(2);
++        assertThat(result.lines()).allMatch(l -> l.best().orElseThrow().poLineId().equals(shared.poLineId()));
++        // Không trừ số dư giữa các dòng: phân bổ là việc của giai đoạn 3
++        assertThat(result.lines()).allMatch(l -> l.best().orElseThrow().availableQty().compareTo(bd("100")) == 0);
++    }
++
++    @Test
++    void shouldReportLinesWithoutCandidates() {
++        poQuery.rows.add(poLine("PO-2026-00001", LocalDate.of(2026, 1, 1), 1, "ITEM-A", "100", "100", "100"));
++
++        CandidateSearchResult result = finder.find(request(null, null, THREE_WAY,
++                invoiceLine("ITEM-A", "1", "100", null),
++                invoiceLine("ITEM-UNKNOWN", "1", "100", null)));
++
++        assertThat(result.linesWithoutCandidates()).hasSize(1);
++        assertThat(result.linesWithoutCandidates().get(0).lineNo()).isEqualTo(2);
++    }
++
++    // ------------------------------------------------------------------ cấu hình
++
++    @Test
++    void shouldApplyMaxPerLineAndMinScore() {
++        for (int i = 1; i <= 8; i++) {
++            poQuery.rows.add(poLine("PO-2026-0000" + i, LocalDate.of(2026, 1, i), 1, "ITEM-A", "100", "100", "100"));
++        }
++        properties.setMaxPerLine(3);
++        assertThat(finder.find(request(null, null, THREE_WAY, invoiceLine("ITEM-A", "1", "100", null)))
++                .lines().get(0).candidates()).hasSize(3);
++
++        properties.setMinScore(new BigDecimal("0.9999"));
++        assertThat(finder.find(request(null, null, THREE_WAY, invoiceLine("ITEM-A", "1", "100", null)))
++                .lines().get(0).candidates()).isEmpty(); // không có số PO → tối đa 0.8750
++    }
++
++    // ------------------------------------------------------------------ truy vấn gửi sang BE-3
++
++    @Test
++    void shouldIssueSingleQueryWithNormalizedSelectors() {
++        UUID hint = UUID.randomUUID();
++        UUID poHint = UUID.randomUUID();
++        finder.find(new CandidateSearchRequest(UUID.randomUUID(), SUPPLIER, ISSUE_DATE, "vnd", " po-2026-00007 ", poHint, THREE_WAY,
++                List.of(invoiceLine(" item-a ", "1", "1", hint), invoiceLine("ITEM-A", "1", "1", null), invoiceLine("item-b", "1", "1", null))));
++
++        assertThat(poQuery.calls).hasSize(1);
++        PoLineCandidateQuery q = poQuery.calls.get(0);
++        assertThat(q.supplierId()).isEqualTo(SUPPLIER);
++        assertThat(q.orderDateTo()).isEqualTo(ISSUE_DATE);
++        assertThat(q.currency()).isEqualTo("VND");
++        assertThat(q.itemCodes()).containsExactlyInAnyOrder("ITEM-A", "ITEM-B");
++        assertThat(q.poLineIds()).containsExactlyInAnyOrder(hint);
++        assertThat(q.poNumber()).isEqualTo("PO-2026-00007");
++        assertThat(q.purchaseOrderId()).isEqualTo(poHint);
++        assertThat(q.limit()).isEqualTo(properties.getMaxScannedPoLines());
++    }
++
++    @Test
++    void shouldNotQueryWhenInvoiceHasNoLines() {
++        CandidateSearchResult result = finder.find(request(null, null, THREE_WAY));
++        assertThat(result.lines()).isEmpty();
++        assertThat(poQuery.calls).isEmpty();
++    }
++
++    // ------------------------------------------------------------------ công thức phụ
++
++    @Test
++    void shouldComputeShortageAndPricePercentages() {
++        assertThat(CandidateFinder.shortagePct(bd("10"), bd("10"))).isEqualByComparingTo("0");
++        assertThat(CandidateFinder.shortagePct(bd("10"), bd("50"))).isEqualByComparingTo("0");
++        assertThat(CandidateFinder.shortagePct(bd("10"), bd("4"))).isEqualByComparingTo("60");
++        assertThat(CandidateFinder.shortagePct(bd("10"), bd("0"))).isEqualByComparingTo("100");
++        assertThat(CandidateFinder.priceVariancePct(bd("102"), bd("100"))).isEqualByComparingTo("2");
++        assertThat(CandidateFinder.priceVariancePct(bd("98"), bd("100"))).isEqualByComparingTo("2");
++        assertThat(CandidateFinder.priceVariancePct(bd("5"), bd("0"))).isEqualByComparingTo("100");
++        assertThat(CandidateFinder.priceVariancePct(bd("0"), bd("0"))).isEqualByComparingTo("0");
++    }
++
++    // ------------------------------------------------------------------ helpers
++
++    private static void assertNonIncreasingScores(LineCandidates line) {
++        for (int i = 1; i < line.candidates().size(); i++) {
++            assertThat(line.candidates().get(i - 1).score().compareTo(line.candidates().get(i).score()) >= 0).isTrue();
++        }
++    }
++
++    /** Đánh số dòng hóa đơn 1, 2, 3... theo thứ tự truyền vào. */
++    private static CandidateSearchRequest request(String poRef, UUID poHint, ToleranceThreshold tol, InvoiceLineToMatch... lines) {
++        List<InvoiceLineToMatch> numbered = new ArrayList<>();
++        for (int i = 0; i < lines.length; i++) {
++            InvoiceLineToMatch l = lines[i];
++            numbered.add(new InvoiceLineToMatch(l.invoiceLineId(), i + 1, l.itemCode(), l.unmatchedQty(), l.unitPrice(), l.poLineIdHint()));
++        }
++        return new CandidateSearchRequest(UUID.randomUUID(), SUPPLIER, ISSUE_DATE, "VND", poRef, poHint, tol, numbered);
++    }
++
++    private static InvoiceLineToMatch invoiceLine(String itemCode, String qty, String price, UUID poLineHint) {
++        return new InvoiceLineToMatch(UUID.randomUUID(), 1, itemCode, bd(qty), bd(price), poLineHint);
++    }
++
++    /** remaining = ordered (allocated = reserved = 0). */
++    private static PoLineCandidateView poLine(String poNumber, LocalDate orderDate, int lineNo, String itemCode,
++                                              String unitPrice, String orderedQty, String receivedQty) {
++        return new PoLineCandidateView(UUID.nameUUIDFromBytes(poNumber.getBytes()), poNumber, SUPPLIER, orderDate,
++                "OPEN", "VND", UUID.randomUUID(), lineNo, itemCode, bd(unitPrice), bd("0.1"),
++                bd(orderedQty), bd("0"), bd("0"), bd(receivedQty));
++    }
++
++    private static BigDecimal bd(String v) {
++        return new BigDecimal(v);
++    }
++
++    private static final class FakePurchaseOrderQueryApi implements PurchaseOrderQueryApi {
++        final List<PoLineCandidateView> rows = new ArrayList<>();
++        final List<PoLineCandidateQuery> calls = new ArrayList<>();
++
++        @Override
++        public List<PoLineCandidateView> findCandidateLines(PoLineCandidateQuery query) {
++            calls.add(query);
++            return List.copyOf(rows);
++        }
++    }
++}
+diff --git a/backend/src/test/java/com/tmw/backend/matching/scoring/ConfidenceScorerUnitTest.java b/backend/src/test/java/com/tmw/backend/matching/scoring/ConfidenceScorerUnitTest.java
+index 026f1eb..b37f3ba 100644
+--- a/backend/src/test/java/com/tmw/backend/matching/scoring/ConfidenceScorerUnitTest.java
++++ b/backend/src/test/java/com/tmw/backend/matching/scoring/ConfidenceScorerUnitTest.java
+@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
+ 
+ import java.math.BigDecimal;
+ import java.util.List;
++import java.util.Random;
+ import java.util.UUID;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+@@ -14,16 +15,17 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ 
+ class ConfidenceScorerUnitTest {
+ 
+-    private ConfidenceWeightProperties defaultWeights;
+     private ConfidenceScorer scorer;
+ 
+     @BeforeEach
+     void setUp() {
+-        defaultWeights = new ConfidenceWeightProperties();
++        ConfidenceWeightProperties defaultWeights = new ConfidenceWeightProperties();
+         defaultWeights.validateWeights();
+         scorer = new ConfidenceScorer(defaultWeights);
+     }
+ 
++    // ------------------------------------------------------------------ cấu hình trọng số
++
+     @Test
+     void shouldRejectInvalidWeightConfigurationsAtStartup() {
+         ConfidenceWeightProperties badSum = new ConfidenceWeightProperties();
+@@ -42,20 +44,21 @@ class ConfidenceScorerUnitTest {
+                         assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
+     }
+ 
++    // ------------------------------------------------------------------ điểm tổng
++
+     @Test
+     void shouldScore1WhenAll5CriteriaMatchPerfectly() {
+         UUID poLineId = UUID.randomUUID();
+         UUID supplierId = UUID.randomUUID();
+ 
+-        ConfidenceInput perfectInput = new ConfidenceInput(
+-                "PO-2026-0012", poLineId, "PO-2026-0012", poLineId,
+-                supplierId, supplierId,
+-                " item-dell-5540 ", "ITEM-DELL-5540",
+-                BigDecimal.ZERO, new BigDecimal("1.0000"),
+-                BigDecimal.ZERO, new BigDecimal("2.0000")
+-        );
+-
+-        ConfidenceBreakdown breakdown = scorer.score(perfectInput);
++        ConfidenceBreakdown breakdown = scorer.score(ConfidenceInput.builder()
++                .invoicePoReference("PO-2026-0012").candidatePoNumber("PO-2026-0012")
++                .invoiceLinePoLineIdHint(poLineId).candidatePoLineId(poLineId)
++                .invoiceSupplierId(supplierId).poSupplierId(supplierId)
++                .invoiceItemCode(" item-dell-5540 ").poItemCode("ITEM-DELL-5540")
++                .priceVariancePct(BigDecimal.ZERO).priceTolerancePct(new BigDecimal("1.0000"))
++                .qtyVariancePct(BigDecimal.ZERO).qtyTolerancePct(new BigDecimal("2.0000"))
++                .build());
+ 
+         assertThat(breakdown.poReferenceScore()).isEqualByComparingTo("1.0000");
+         assertThat(breakdown.supplierScore()).isEqualByComparingTo("1.0000");
+@@ -67,7 +70,7 @@ class ConfidenceScorerUnitTest {
+ 
+     @Test
+     void shouldApplyPartialScoresAndCustomConfiguredWeightsAccurately() {
+-        // Cấu hình trọng số tùy chỉnh: poRef=0.30, supplier=0.20, itemCode=0.20, price=0.15, quantity=0.15
++        // Trọng số tùy chỉnh: poRef=0.30, supplier=0.20, itemCode=0.20, price=0.15, quantity=0.15
+         ConfidenceWeightProperties customWeights = new ConfidenceWeightProperties();
+         customWeights.setPoReference(new BigDecimal("0.3000"));
+         customWeights.setSupplier(new BigDecimal("0.2000"));
+@@ -75,47 +78,39 @@ class ConfidenceScorerUnitTest {
+         customWeights.setPrice(new BigDecimal("0.1500"));
+         customWeights.setQuantity(new BigDecimal("0.1500"));
+         customWeights.validateWeights();
+-
+         ConfidenceScorer customScorer = new ConfidenceScorer(customWeights);
+ 
+         UUID supplierId = UUID.randomUUID();
+-        ConfidenceInput partialInput = new ConfidenceInput(
+-                null, null, "PO-2026-0099", UUID.randomUUID(),   // Không có PO ref -> 0.5000
+-                supplierId, supplierId,                           // Khớp supplier -> 1.0000
+-                "ITEM-001-HCM", "ITEM-001",                       // Khớp một phần mã hàng -> 0.5000
+-                new BigDecimal("1.0000"), new BigDecimal("1.0000"), // Chạm biên ngưỡng giá -> 0.7000
+-                new BigDecimal("0.0000"), new BigDecimal("2.0000")  // Khớp số lượng -> 1.0000
+-        );
+-
+-        ConfidenceBreakdown breakdown = customScorer.score(partialInput);
+-
+-        // Kỳ vọng: 0.5*0.30 + 1.0*0.20 + 0.5*0.20 + 0.7*0.15 + 1.0*0.15 = 0.15 + 0.20 + 0.10 + 0.105 + 0.15 = 0.7050
++        ConfidenceBreakdown breakdown = customScorer.score(ConfidenceInput.builder()
++                .candidatePoNumber("PO-2026-0099").candidatePoId(UUID.randomUUID())  // không có PO ref -> 0.5
++                .invoiceSupplierId(supplierId).poSupplierId(supplierId)               // khớp NCC -> 1.0
++                .invoiceItemCode("ITEM-001-HCM").poItemCode("ITEM-001")               // khớp một phần -> 0.5
++                .priceVariancePct(new BigDecimal("1.0000")).priceTolerancePct(new BigDecimal("1.0000")) // chạm biên -> 0.7
++                .qtyVariancePct(BigDecimal.ZERO).qtyTolerancePct(new BigDecimal("2.0000"))              // đủ SL -> 1.0
++                .build());
++
++        // 0.5*0.30 + 1.0*0.20 + 0.5*0.20 + 0.7*0.15 + 1.0*0.15 = 0.7050
+         assertThat(breakdown.poReferenceScore()).isEqualByComparingTo("0.5000");
+         assertThat(breakdown.itemCodeScore()).isEqualByComparingTo("0.5000");
+         assertThat(breakdown.priceScore()).isEqualByComparingTo("0.7000");
+         assertThat(breakdown.overallScore()).isEqualByComparingTo("0.7050");
+-
+-        BigDecimal aggregated = customScorer.aggregateOverall(List.of(breakdown));
+-        assertThat(aggregated).isEqualByComparingTo("0.7050");
++        assertThat(customScorer.aggregateOverall(List.of(breakdown))).isEqualByComparingTo("0.7050");
+     }
+ 
+     @Test
+     void shouldPenalizeVarianceOutsideToleranceBelow07000() {
+-        UUID supplierId = UUID.randomUUID();
+-        ConfidenceInput outOfToleranceInput = new ConfidenceInput(
+-                null, null, "PO-2026-0099", UUID.randomUUID(),
+-                supplierId, supplierId,
+-                "ITEM-A", "ITEM-A",
+-                new BigDecimal("50.5000"), new BigDecimal("1.0000"), // Lệch 50.5% trên ngưỡng 1% -> 0.3500
+-                new BigDecimal("100.0000"), new BigDecimal("2.0000") // Lệch 100% -> 0.0000
+-        );
+-
+-        ConfidenceBreakdown breakdown = scorer.score(outOfToleranceInput);
++        ConfidenceBreakdown breakdown = scorer.score(ConfidenceInput.builder()
++                .invoiceItemCode("ITEM-A").poItemCode("ITEM-A")
++                .priceVariancePct(new BigDecimal("50.5000")).priceTolerancePct(new BigDecimal("1.0000")) // -> 0.35
++                .qtyVariancePct(new BigDecimal("100.0000")).qtyTolerancePct(new BigDecimal("2.0000"))    // -> 0
++                .build());
+ 
+         assertThat(breakdown.priceScore()).isEqualByComparingTo("0.3500");
+         assertThat(breakdown.quantityScore()).isEqualByComparingTo("0.0000");
+     }
+ 
++    // ------------------------------------------------------------------ tiêu chí số PO
++
+     @Test
+     void shouldMatchPoReferenceAsStringIgnoringCaseAndSurroundingSpaces() {
+         assertThat(poReferenceScore(" po-2026-0012 ", "PO-2026-0012")).isEqualByComparingTo("1.0000");
+@@ -128,18 +123,72 @@ class ConfidenceScorerUnitTest {
+     @Test
+     void shouldScore1WhenInvoiceLinePointsToCandidatePoLineEvenIfHeaderRefMissing() {
+         UUID poLineId = UUID.randomUUID();
+-        ConfidenceInput input = new ConfidenceInput(
+-                null, poLineId, "PO-2026-0012", poLineId,
+-                null, null, null, null, null, null, null, null
+-        );
+-        assertThat(scorer.score(input).poReferenceScore()).isEqualByComparingTo("1.0000");
++        ConfidenceBreakdown breakdown = scorer.score(ConfidenceInput.builder()
++                .invoiceLinePoLineIdHint(poLineId).candidatePoLineId(poLineId).candidatePoNumber("PO-2026-0012")
++                .build());
++        assertThat(breakdown.poReferenceScore()).isEqualByComparingTo("1.0000");
++    }
++
++    @Test
++    void shouldUseInvoiceHeaderPurchaseOrderIdHint() {
++        UUID poId = UUID.randomUUID();
++        assertThat(scorer.score(ConfidenceInput.builder()
++                .invoicePoIdHint(poId).candidatePoId(poId).build()).poReferenceScore())
++                .isEqualByComparingTo("1.0000");
++        // Có gợi ý PO nhưng ứng viên thuộc PO khác -> 0
++        assertThat(scorer.score(ConfidenceInput.builder()
++                .invoicePoIdHint(poId).candidatePoId(UUID.randomUUID()).build()).poReferenceScore())
++                .isEqualByComparingTo("0.0000");
++    }
++
++    // ------------------------------------------------------------------ an toàn với dữ liệu thiếu
++
++    @Test
++    void shouldNotFailOnAllNullInputAndGiveOnlyNeutralPoReferenceScore() {
++        ConfidenceBreakdown breakdown = scorer.score(ConfidenceInput.builder().build());
++
++        assertThat(breakdown.poReferenceScore()).isEqualByComparingTo("0.5000");
++        assertThat(breakdown.supplierScore()).isEqualByComparingTo("0.0000");
++        assertThat(breakdown.itemCodeScore()).isEqualByComparingTo("0.0000");
++        assertThat(breakdown.priceScore()).isEqualByComparingTo("0.0000");
++        assertThat(breakdown.quantityScore()).isEqualByComparingTo("0.0000");
++        assertThat(breakdown.overallScore()).isEqualByComparingTo("0.1250"); // 0.5 * 0.25
++    }
++
++    @Test
++    void shouldAlwaysKeepEveryScoreWithin0And1ForRandomInputs() {
++        Random random = new Random(20261127L);
++        UUID supplier = UUID.randomUUID();
++        for (int i = 0; i < 500; i++) {
++            ConfidenceBreakdown b = scorer.score(ConfidenceInput.builder()
++                    .invoicePoReference(random.nextBoolean() ? "PO-" + random.nextInt(5) : null)
++                    .candidatePoNumber("PO-" + random.nextInt(5))
++                    .invoiceSupplierId(supplier).poSupplierId(random.nextBoolean() ? supplier : UUID.randomUUID())
++                    .invoiceItemCode("ITEM-" + random.nextInt(3)).poItemCode("ITEM-" + random.nextInt(3))
++                    .priceVariancePct(BigDecimal.valueOf(random.nextInt(30000), 2))   // 0..300%
++                    .priceTolerancePct(BigDecimal.valueOf(random.nextInt(1000), 2))  // 0..10%
++                    .qtyVariancePct(BigDecimal.valueOf(random.nextInt(10001), 2))    // 0..100%
++                    .qtyTolerancePct(BigDecimal.valueOf(random.nextInt(1000), 2))
++                    .build());
++            for (BigDecimal s : List.of(b.poReferenceScore(), b.supplierScore(), b.itemCodeScore(),
++                    b.priceScore(), b.quantityScore(), b.overallScore())) {
++                assertThat(s.signum() >= 0 && s.compareTo(BigDecimal.ONE) <= 0).isTrue();
++            }
++        }
++    }
++
++    @Test
++    void shouldRejectNullInput() {
++        assertThatThrownBy(() -> scorer.score(null))
++                .isInstanceOfSatisfying(BusinessException.class, ex ->
++                        assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
+     }
+ 
+     private BigDecimal poReferenceScore(String invoiceRef, String candidatePoNumber) {
+-        ConfidenceInput input = new ConfidenceInput(
+-                invoiceRef, null, candidatePoNumber, UUID.randomUUID(),
+-                null, null, null, null, null, null, null, null
+-        );
+-        return scorer.score(input).poReferenceScore();
++        return scorer.score(ConfidenceInput.builder()
++                .invoicePoReference(invoiceRef)
++                .candidatePoNumber(candidatePoNumber)
++                .candidatePoLineId(UUID.randomUUID())
++                .build()).poReferenceScore();
+     }
+ }
+diff --git a/backend/src/test/java/com/tmw/backend/purchaseorder/PoLineCandidateQueryUnitTest.java b/backend/src/test/java/com/tmw/backend/purchaseorder/PoLineCandidateQueryUnitTest.java
+new file mode 100644
+index 0000000..578d517
+--- /dev/null
++++ b/backend/src/test/java/com/tmw/backend/purchaseorder/PoLineCandidateQueryUnitTest.java
+@@ -0,0 +1,54 @@
++package com.tmw.backend.purchaseorder;
++
++import com.tmw.backend.common.error.BusinessException;
++import com.tmw.backend.common.error.ErrorCode;
++import com.tmw.backend.purchaseorder.api.PoLineCandidateQuery;
++import org.junit.jupiter.api.Test;
++
++import java.time.LocalDate;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.UUID;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++class PoLineCandidateQueryUnitTest {
++
++    private static final UUID SUPPLIER = UUID.randomUUID();
++    private static final LocalDate DATE = LocalDate.of(2026, 11, 27);
++
++    @Test
++    void shouldNormalizeCodesNumberAndCurrencyLikePoLineEntity() {
++        PoLineCandidateQuery q = new PoLineCandidateQuery(SUPPLIER, DATE, " vnd ",
++                new HashSet<>(Arrays.asList(" item-a ", "ITEM-A", "", null, "item-b")),
++                new HashSet<>(Arrays.asList(null, UUID.randomUUID())),
++                " po-2026-00001 ", null, 100);
++
++        assertThat(q.currency()).isEqualTo("VND");
++        assertThat(q.itemCodes()).containsExactlyInAnyOrder("ITEM-A", "ITEM-B");
++        assertThat(q.poLineIds()).hasSize(1);
++        assertThat(q.poNumber()).isEqualTo("PO-2026-00001");
++        assertThat(q.hasNoSelector()).isFalse();
++    }
++
++    @Test
++    void shouldDetectQueryWithoutAnySelector() {
++        PoLineCandidateQuery q = new PoLineCandidateQuery(SUPPLIER, DATE, null, Set.of(), null, "  ", null, 10);
++        assertThat(q.hasNoSelector()).isTrue();
++    }
++
++    @Test
++    void shouldValidateRequiredFieldsAndLimit() {
++        assertThatThrownBy(() -> new PoLineCandidateQuery(null, DATE, null, Set.of("A"), null, null, null, 10))
++                .isInstanceOfSatisfying(BusinessException.class, ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
++        assertThatThrownBy(() -> new PoLineCandidateQuery(SUPPLIER, null, null, Set.of("A"), null, null, null, 10))
++                .isInstanceOfSatisfying(BusinessException.class, ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
++        assertThatThrownBy(() -> new PoLineCandidateQuery(SUPPLIER, DATE, null, Set.of("A"), null, null, null, 0))
++                .isInstanceOfSatisfying(BusinessException.class, ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
++        assertThatThrownBy(() -> new PoLineCandidateQuery(SUPPLIER, DATE, null, Set.of("A"), null, null, null,
++                PoLineCandidateQuery.MAX_LIMIT + 1))
++                .isInstanceOfSatisfying(BusinessException.class, ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR));
++    }
++}
+diff --git a/backend/src/test/resources/matching/candidate-finder-schema.sql b/backend/src/test/resources/matching/candidate-finder-schema.sql
+new file mode 100644
+index 0000000..523366d
+--- /dev/null
++++ b/backend/src/test/resources/matching/candidate-finder-schema.sql
+@@ -0,0 +1,44 @@
++-- Bản sao tối thiểu các bảng của BE-3 (khớp entity PurchaseOrder / PurchaseOrderLine / PoLineCapacity)
++-- chỉ dùng cho test CandidateFinder khi BE-3 chưa có migration tạo bảng.
++-- Khi migration của BE-3 có trên develop, test nên chuyển sang chạy migration thật.
++
++CREATE TABLE purchase_order (
++    id           UUID          PRIMARY KEY,
++    po_number    VARCHAR(50)   NOT NULL,
++    supplier_id  UUID          NOT NULL,
++    order_date   DATE          NOT NULL,
++    currency     VARCHAR(10)   NOT NULL,
++    total_amount NUMERIC(19,4) NOT NULL DEFAULT 0,
++    status       VARCHAR(30)   NOT NULL,
++    version      BIGINT        NOT NULL DEFAULT 0,
++    created_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
++    updated_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
++    CONSTRAINT uk_purchase_order_po_number UNIQUE (po_number)
++);
++
++CREATE TABLE po_line (
++    id                UUID          PRIMARY KEY,
++    purchase_order_id UUID          NOT NULL REFERENCES purchase_order (id),
++    line_no           INTEGER       NOT NULL,
++    item_code         VARCHAR(100)  NOT NULL,
++    description       VARCHAR(500),
++    ordered_qty       NUMERIC(19,4) NOT NULL,
++    unit_price        NUMERIC(19,4) NOT NULL,
++    vat_rate          NUMERIC(19,4) NOT NULL,
++    created_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
++    updated_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
++    CONSTRAINT uk_po_line_po_id_line_no UNIQUE (purchase_order_id, line_no)
++);
++
++CREATE TABLE po_line_capacity (
++    po_line_id       UUID          PRIMARY KEY REFERENCES po_line (id),
++    ordered_qty      NUMERIC(19,4) NOT NULL,
++    allocated_qty    NUMERIC(19,4) NOT NULL DEFAULT 0,
++    reserved_qty     NUMERIC(19,4) NOT NULL DEFAULT 0,
++    received_qty     NUMERIC(19,4) NOT NULL DEFAULT 0,
++    ordered_amount   NUMERIC(19,4) NOT NULL,
++    allocated_amount NUMERIC(19,4) NOT NULL DEFAULT 0,
++    reserved_amount  NUMERIC(19,4) NOT NULL DEFAULT 0,
++    received_amount  NUMERIC(19,4) NOT NULL DEFAULT 0,
++    version          BIGINT        NOT NULL DEFAULT 0
++);
+diff --git a/backend/src/test/resources/matching/candidate-finder-seed-1000-po.sql b/backend/src/test/resources/matching/candidate-finder-seed-1000-po.sql
+new file mode 100644
+index 0000000..82dbc84
+--- /dev/null
++++ b/backend/src/test/resources/matching/candidate-finder-seed-1000-po.sql
+@@ -0,0 +1,45 @@
++-- Dữ liệu tất định: 50 nhà cung cấp x 20 PO = 1.000 PO, mỗi PO 5 dòng = 5.000 dòng PO.
++-- Nhà cung cấp s:  UUID 00000000-0000-4000-8000-<s 12 chữ số>
++-- PO p (1..1000):  supplier = ((p-1) % 50) + 1, số PO = 'PO-2026-' || lpad(p, 5, '0')
++-- Mã hàng:         'ITEM-' || lpad(((p * 7 + l * 13) % 200) + 1, 4, '0')  (200 mã)
++-- Trạng thái:      p % 20 = 0 → CLOSED; p % 10 = 0 → FULLY_INVOICED; p % 7 = 0 → PARTIALLY_INVOICED; còn lại OPEN
++-- Ngày đặt:        2026-01-01 + (p % 300) ngày
++-- Hạn mức:         ordered = 10 + (p*l % 91); allocated/reserved/received theo công thức bên dưới
++
++INSERT INTO purchase_order (id, po_number, supplier_id, order_date, currency, status)
++SELECT ('10000000-0000-4000-8000-' || lpad(p::text, 12, '0'))::uuid,
++       'PO-2026-' || lpad(p::text, 5, '0'),
++       ('00000000-0000-4000-8000-' || lpad((((p - 1) % 50) + 1)::text, 12, '0'))::uuid,
++       DATE '2026-01-01' + (p % 300),
++       'VND',
++       CASE WHEN p % 20 = 0 THEN 'CLOSED'
++            WHEN p % 10 = 0 THEN 'FULLY_INVOICED'
++            WHEN p % 7  = 0 THEN 'PARTIALLY_INVOICED'
++            ELSE 'OPEN' END
++FROM generate_series(1, 1000) AS p;
++
++INSERT INTO po_line (id, purchase_order_id, line_no, item_code, ordered_qty, unit_price, vat_rate)
++SELECT ('20000000-0000-4000-8000-' || lpad((p * 10 + l)::text, 12, '0'))::uuid,
++       ('10000000-0000-4000-8000-' || lpad(p::text, 12, '0'))::uuid,
++       l,
++       'ITEM-' || lpad((((p * 7 + l * 13) % 200) + 1)::text, 4, '0'),
++       10 + (p * l % 91),
++       1000 * (1 + (p + l) % 50),
++       0.1000
++FROM generate_series(1, 1000) AS p, generate_series(1, 5) AS l;
++
++-- allocated: 0..(ordered/2); reserved: 0 hoặc 1 phần nhỏ; received: dòng l=5 chưa nhận hàng, còn lại nhận 60..100%
++INSERT INTO po_line_capacity (po_line_id, ordered_qty, allocated_qty, reserved_qty, received_qty, ordered_amount)
++SELECT pl.id,
++       pl.ordered_qty,
++       floor(pl.ordered_qty * ((p * 3 + l) % 6) / 10),
++       CASE WHEN (p + l) % 4 = 0 THEN 2 ELSE 0 END,
++       CASE WHEN l = 5 THEN 0 ELSE floor(pl.ordered_qty * (6 + (p + l) % 5) / 10) END,
++       pl.ordered_qty * pl.unit_price
++FROM generate_series(1, 1000) AS p
++CROSS JOIN generate_series(1, 5) AS l
++JOIN po_line pl ON pl.id = ('20000000-0000-4000-8000-' || lpad((p * 10 + l)::text, 12, '0'))::uuid;
++
++ANALYZE purchase_order;
++ANALYZE po_line;
++ANALYZE po_line_capacity;
+diff --git a/docs/be5/candidate-finder-performance.md b/docs/be5/candidate-finder-performance.md
+new file mode 100644
+index 0000000..5a138f2
+--- /dev/null
++++ b/docs/be5/candidate-finder-performance.md
+@@ -0,0 +1,50 @@
++# Đo hiệu năng truy vấn ứng viên (BE-5, giai đoạn 2)
++
++## Cách đo
++
++- PostgreSQL 16. Dữ liệu tất định từ `backend/src/test/resources/matching/candidate-finder-seed-1000-po.sql`: 50 nhà cung cấp, mỗi nhà 20 PO, tổng **1.000 PO / 5.000 dòng PO**, 200 mã hàng. Trạng thái và hạn mức trộn lẫn nhau; dòng số 5 của mỗi PO chưa nhận hàng.
++- Câu truy vấn: `backend/src/main/resources/sql/purchaseorder/find-candidate-po-lines.sql`, đúng câu mà `JdbcPurchaseOrderQueryService` chạy.
++- Tải thử: 300 hóa đơn ngẫu nhiên (seed cố định). Mỗi hóa đơn 3 mã hàng có thật của nhà cung cấp, một nửa số hóa đơn có ghi số PO. Chạy 20 truy vấn làm nóng trước khi đo.
++- Để thấy index có tác dụng khi dữ liệu lớn hơn, đo thêm với 20.000 PO / 100.000 dòng.
++
++## Kết quả
++
++| Dữ liệu | Index | p50 | p95 |
++|---|---|---|---|
++| 1.000 PO / 5.000 dòng | không | 0,48 ms | 0,65 ms |
++| 1.000 PO / 5.000 dòng | có | **0,33 ms** | **0,51 ms** |
++| 20.000 PO / 100.000 dòng | không | 4,12 ms | 5,68 ms |
++| 20.000 PO / 100.000 dòng | có | **0,67 ms** | **0,99 ms** |
++
++Kế hoạch thực thi khi có index (20.000 PO) đi qua index ở cả ba bước:
++
++```
++Nested Loop
++  -> Nested Loop
++       -> Bitmap Heap Scan on purchase_order po
++            -> Bitmap Index Scan on idx_purchase_order_supplier_status_date
++       -> Index Scan using idx_po_line_po_item on po_line pl
++  -> Index Scan using po_line_capacity_pkey on po_line_capacity c
++```
++
++Ở mức 1.000 PO, planner vẫn quét tuần tự `po_line` (5.000 dòng) vì rẻ hơn. Khi bảng lớn lên, planner tự chuyển sang dùng `idx_po_line_po_item`.
++
++## Index (`db/migration/R__matching_candidate_finder_indexes.sql`)
++
++- `idx_purchase_order_supplier_status_date (supplier_id, status, order_date) INCLUDE (po_number, currency)`
++- `idx_po_line_po_item (purchase_order_id, item_code)`
++- `idx_po_line_item_code (item_code)`
++
++File này là migration kiểu `R__` (repeatable): Flyway luôn chạy nó sau mọi migration `V__`, nên chạy được kể cả khi migration tạo bảng của BE-3 có timestamp muộn hơn.
++
++## Chạy lại
++
++```powershell
++cd backend
++.\mvnw.cmd test "-Dtest=CandidateFinderPerformanceIntegrationTest"   # cần Docker
++```
++
++Test in ra p50/p95 của 300 lần `CandidateFinder.find` (gồm cả phần chấm điểm) và kiểm tra:
++- p95 dưới 50 ms (ngưỡng nới rộng cho CI);
++- kế hoạch thực thi dùng `idx_purchase_order_supplier_status_date`;
++- kết quả chỉ gồm dòng PO đang mở, đúng nhà cung cấp, còn hạn mức, sắp theo PO cũ trước.
+diff --git a/docs/be5/thiet-ke-phan-bo-mot-nhieu-nhieu-mot.md b/docs/be5/thiet-ke-phan-bo-mot-nhieu-nhieu-mot.md
+new file mode 100644
+index 0000000..8880396
+--- /dev/null
++++ b/docs/be5/thiet-ke-phan-bo-mot-nhieu-nhieu-mot.md
+@@ -0,0 +1,38 @@
++# Thiết kế: phân bổ ghép một-nhiều và nhiều-một (BE-5, giai đoạn 2)
++
++Dùng cho `POST /invoices/{invoiceId}/match-runs` ở giai đoạn 3. Đầu vào là kết quả `CandidateFinder`: với mỗi dòng hóa đơn, danh sách dòng PO ứng viên đã xếp hạng. CandidateFinder **không** chia số lượng. Việc chia nằm ở bộ phân bổ mô tả dưới đây.
++
++## 1. Ràng buộc (mục 1.2 bản phân công v2)
++
++| Vế | Điều kiện | Nguồn số liệu |
++|---|---|---|
++| PO | allocated + reserved + qty ≤ ordered | `po_line_capacity` |
++| GRN (khi `require_grn`) | allocated + reserved + qty ≤ received | `po_line_capacity.received_qty` (cộng dồn mọi GRN của dòng PO) |
++| Dòng hóa đơn | matched_qty + qty ≤ qty | `invoice_line` |
++
++`referenceQty` dùng cho `VarianceCalculator`: đối chiếu 3 chiều lấy **số lượng GRN còn lại** (received − allocated − reserved), 2 chiều lấy **số lượng PO còn lại**. Khi `referenceQty = 0`, `VarianceResult.missingReferenceQty()` bật và engine sinh `MISSING_GRN`.
++
++## 2. Thuật toán: tham lam, xác định, giải thích được
++
++1. **Thứ tự dòng hóa đơn:** dòng ít ứng viên nhất đi trước (khó ghép nhất), rồi đến `line_no`. Nhờ vậy dòng PO hiếm không bị dòng dễ ghép chiếm mất.
++2. **Sổ tạm trong bộ nhớ:** `available[po_line] = CandidateFinder.availableQty` (min của vế PO và vế GRN). Mỗi lần lấy thì trừ vào sổ, để nhiều dòng hóa đơn trỏ cùng một dòng PO (nhiều-một) không lấy quá tổng.
++3. **Với mỗi dòng hóa đơn**, duyệt ứng viên theo `rank` (điểm cao trước, cùng điểm thì PO cũ trước). Mỗi bước lấy `q = min(còn cần, available[po_line])`. Nếu `q > 0` thì tạo một `MatchLine(invoice_line, po_line, q)` và trừ sổ. Một dòng hóa đơn trải qua nhiều dòng PO là **một-nhiều (tách dòng hóa đơn)**.
++4. **Chọn GRN cho 3 chiều:** trong cùng dòng PO, chọn GRN line **cũ nhất** (FIFO theo `received_date`) còn số dư làm `grn_line_id`. Vế GRN vẫn kiểm theo tổng ở `po_line_capacity`. Do có unique `(match, invoice_line, po_line)`, mỗi cặp chỉ có một `MatchLine`. Nếu sau này cần truy vết số lượng theo từng GRN line, giai đoạn 3 phải đổi unique thành `(match, invoice_line, po_line, grn_line)`; đây là điểm cần chốt với Tech Lead.
++5. **Phần còn thiếu** sau khi duyệt hết ứng viên sẽ thành `MatchException` (qua `ExceptionFactoryService` của BE-7). Lệnh chạy không bị hủy:
++   - không có ứng viên nào: `MISSING_PO`;
++   - có ứng viên nhưng vế GRN bằng 0 (`missingGrn = true`): `MISSING_GRN`;
++   - vế PO hết khi giữ chỗ thật: `CAPACITY_EXCEEDED`.
++6. **Tính chênh lệch và dung sai** cho từng `MatchLine`: `VarianceCalculator`, sau đó `ToleranceEvaluationService` (BE-2) gắn `within_tolerance`. Điểm `Match` là trung bình điểm các dòng. Đề xuất cho giai đoạn 3: lấy trung bình **có trọng số theo `matched_amount`**.
++7. **Giữ chỗ thật:** gọi BE-3 theo `po_line_id` tăng dần (tránh deadlock). Cần `tryReserve`/`reserveBatch` trả kết quả từng dòng thay vì ném exception, vì exception trong `@Transactional` đánh dấu rollback-only cả lệnh chạy. Dòng bị từ chối chuyển sang bước 5 với loại `CAPACITY_EXCEEDED`.
++
++## 3. Ví dụ
++
++**Một-nhiều.** Dòng hóa đơn 120 cái ITEM-A. Ứng viên PO-A (đặt 01/03, còn 80) và PO-B (đặt 15/03, còn 100), cùng điểm. Kết quả: lấy 80 từ PO-A (cũ hơn), rồi 40 từ PO-B. Tạo 2 `MatchLine`.
++
++**Nhiều-một.** Dòng 1 cần 30, dòng 2 cần 50, cùng trỏ một dòng PO còn 60. Hai dòng có cùng số ứng viên nên xét theo `line_no`: dòng 1 đi trước, lấy 30 (sổ còn 30). Dòng 2 lấy 30, còn thiếu 20: duyệt ứng viên kế tiếp; nếu không còn ứng viên thì tạo ngoại lệ cho 20 cái còn thiếu.
++
++**Giao nhiều đợt (3 chiều).** Dòng PO đặt 100; GRN1 (05/03) nhận 40, GRN2 (20/03) nhận 30; đã allocated 10. Vế GRN = 70 − 10 = 60. Hóa đơn 50 cái: ghép 50, `grn_line_id` = dòng của GRN1 (cũ nhất).
++
++## 4. Vì sao không tối ưu toàn cục
++
++Bài toán là luồng chi phí nhỏ nhất nếu muốn tối ưu tuyệt đối. Với quy mô một hóa đơn (vài chục dòng, vài trăm ứng viên), cách tham lam ở trên cho kết quả **xác định** (chạy lại ra cùng kết quả), **dễ giải thích** với kế toán ("lấy PO cũ trước, điểm cao trước"), và chạy trong O(dòng × ứng viên).
+-- 
+2.43.0
+
